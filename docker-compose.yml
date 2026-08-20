@@ -1,0 +1,619 @@
+# SOUQ — the whole platform on one machine.
+#
+#   make up          bring up infrastructure and wait for it to be healthy
+#   make seed        load demo catalogue, stock and users
+#   make smoke       run an end-to-end checkout against the local stack
+#   make down        stop everything
+#   make nuke        stop everything and delete the volumes
+#
+# Profiles keep the resource cost sane:
+#   (default)   datastores + Kafka + LocalStack — what you need to run one
+#               service from your IDE against real dependencies
+#   services    all 11 backend services
+#   frontend    storefront + admin
+#   observability  Jaeger, Prometheus, Grafana
+#
+#   docker compose --profile services --profile frontend up -d
+#
+# Everything here is disposable. Passwords are literals on purpose: nothing in
+# this file should ever resemble a credential that exists anywhere real, so
+# that a copy-paste into a production values file is obviously wrong.
+
+name: souq
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks: [souq]
+  environment: &common-env
+    SOUQ_ENV: local
+    SOUQ_VERSION: dev
+    SOUQ_LOG_LEVEL: debug
+    SOUQ_KAFKA_BROKERS: kafka:29092
+    SOUQ_JWKS_URL: http://identity-service:8081/v1/.well-known/jwks.json
+    SOUQ_JWT_ISSUER: http://localhost:8081
+    SOUQ_JWT_AUDIENCE: souq-api
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    OTEL_TRACES_EXPORTER: otlp
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+networks:
+  souq:
+    name: souq
+
+volumes:
+  postgres-data:
+  mysql-data:
+  mongo-data:
+  cassandra-data:
+  redis-data:
+  kafka-data:
+  elasticsearch-data:
+  localstack-data:
+  grafana-data:
+
+services:
+  # ===========================================================================
+  # Datastores
+  # ===========================================================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: souq-postgres
+    networks: [souq]
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: souq
+      POSTGRES_PASSWORD: souq_local_only
+      # One cluster, five logical databases — created by the init script.
+      # Separate DATABASES, not separate schemas: it keeps the
+      # database-per-service boundary (docs/CONTRACTS.md §6) enforceable
+      # locally, so a service that reaches across it fails here rather than in
+      # staging. In AWS each is its own Aurora cluster.
+      POSTGRES_MULTIPLE_DATABASES: identity,catalog,orders,inventory,payments
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/00-databases.sh:ro
+    command:
+      - postgres
+      - -c
+      - max_connections=300          # 11 services x pools, plus room for psql
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - log_min_duration_statement=200   # surface slow queries during dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U souq"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mysql:
+    image: mysql:8.4
+    container_name: souq-mysql
+    networks: [souq]
+    ports: ["3306:3306"]
+    environment:
+      MYSQL_ROOT_PASSWORD: souq_local_only
+      MYSQL_DATABASE: analytics_ops
+      MYSQL_USER: souq
+      MYSQL_PASSWORD: souq_local_only
+    volumes: [mysql-data:/var/lib/mysql]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-psouq_local_only"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  mongodb:
+    image: mongo:7
+    container_name: souq-mongo
+    networks: [souq]
+    ports: ["27017:27017"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: souq
+      MONGO_INITDB_ROOT_PASSWORD: souq_local_only
+      MONGO_INITDB_DATABASE: reviews
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  cassandra:
+    image: cassandra:5.0
+    container_name: souq-cassandra
+    networks: [souq]
+    ports: ["9042:9042"]
+    environment:
+      CASSANDRA_CLUSTER_NAME: souq
+      CASSANDRA_DC: local
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      # Cassandra defaults to a heap sized for a production node and will eat
+      # 8GB of a laptop given the chance.
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    volumes: [cassandra-data:/var/lib/cassandra]
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      # Cassandra is genuinely slow to start; 40 x 15s is ~10 minutes of grace.
+      retries: 40
+      start_period: 60s
+
+  redis:
+    image: redis:7-alpine
+    container_name: souq-redis
+    networks: [souq]
+    ports: ["6379:6379"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      # Carts have a TTL and are reconstructible; evicting the coldest under
+      # pressure is correct. Production uses the same policy, so an eviction
+      # bug shows up here rather than on Black Friday.
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: souq-elasticsearch
+    networks: [souq]
+    ports: ["9200:9200"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    volumes: [elasticsearch-data:/usr/share/elasticsearch/data]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: souq-kibana
+    networks: [souq]
+    ports: ["5601:5601"]
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    profiles: [observability]
+
+  # ===========================================================================
+  # Event backbone
+  # ===========================================================================
+
+  kafka:
+    # KRaft: no ZooKeeper. One less container and one less thing to explain.
+    image: bitnami/kafka:3.8
+    container_name: souq-kafka
+    networks: [souq]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:9093,EXTERNAL://:9092
+      # Two listeners: containers reach kafka:29092, your IDE reaches
+      # localhost:9092. Getting this wrong is the single most common reason a
+      # local Kafka "works" from a container and hangs from the host.
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      # OFF. Every topic in this platform has a deliberate partition count and
+      # cleanup policy (docs/CONTRACTS.md §3.1); auto-creation would silently
+      # give a typo'd topic name one partition and delete-retention, and the
+      # bug would only surface under load in staging.
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_CFG_LOG_RETENTION_HOURS: "168"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes: [kafka-data:/bitnami/kafka]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  kafka-init:
+    image: bitnami/kafka:3.8
+    container_name: souq-kafka-init
+    networks: [souq]
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
+    volumes:
+      - ./scripts/create-topics.sh:/scripts/create-topics.sh:ro
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: souq-kafka-ui
+    networks: [souq]
+    ports: ["8090:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka: { condition: service_healthy }
+    profiles: [observability]
+
+  # ===========================================================================
+  # AWS emulation
+  # ===========================================================================
+
+  localstack:
+    # Stands in for S3, SES, SNS, SQS, Secrets Manager and KMS. Personalize is
+    # NOT emulated — recommendation-service falls back to its own ranker when
+    # it cannot reach Personalize, and locally that fallback IS the behaviour.
+    # Pretending otherwise would hide the code path that actually runs when
+    # AWS has a bad day.
+    image: localstack/localstack:3
+    container_name: souq-localstack
+    networks: [souq]
+    ports: ["4566:4566"]
+    environment:
+      SERVICES: s3,ses,sns,sqs,secretsmanager,kms,dynamodb
+      DEBUG: "0"
+      PERSISTENCE: "1"
+      AWS_DEFAULT_REGION: eu-west-1
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - ./scripts/init-localstack.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health | grep -q '\"s3\": \"available\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # ===========================================================================
+  # Observability
+  # ===========================================================================
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: souq-jaeger
+    networks: [souq]
+    ports:
+      - "16686:16686"   # UI
+      - "4317:4317"     # OTLP gRPC
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    profiles: [observability]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: souq-prometheus
+    networks: [souq]
+    ports: ["9090:9090"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+    profiles: [observability]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: souq-grafana
+    networks: [souq]
+    ports: ["3030:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: souq_local_only
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+    profiles: [observability]
+
+  # ===========================================================================
+  # Application services
+  # ===========================================================================
+
+  identity-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/identity-service/Dockerfile
+    container_name: souq-identity
+    ports: ["8081:8081"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: ":8081"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/identity
+      SPRING_DATASOURCE_USERNAME: souq
+      SPRING_DATASOURCE_PASSWORD: souq_local_only
+      SOUQ_REDIS_URL: redis://redis:6379/1
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      # The outbox relay publishes notification commands. Without this the relay
+      # logs a connection failure on every 500 ms poll from the moment it starts.
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  catalog-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/catalog-service/Dockerfile
+    container_name: souq-catalog
+    ports: ["8082:8082"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: ":8082"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/catalog
+      SPRING_DATASOURCE_USERNAME: souq
+      SPRING_DATASOURCE_PASSWORD: souq_local_only
+      SOUQ_S3_ENDPOINT: http://localstack:4566
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  cart-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/cart-service/Dockerfile
+    container_name: souq-cart
+    ports: ["8083:8083"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: "0.0.0.0:8083"
+      SOUQ_REDIS_URL: redis://redis:6379/0
+      SOUQ_PRICING_GRPC: pricing-engine:9089
+      SOUQ_CATALOG_URL: http://catalog-service:8082
+    depends_on:
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  order-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/order-service/Dockerfile
+    container_name: souq-order
+    ports: ["8084:8084"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: ":8084"
+      SOUQ_DB_URL: postgres://souq:souq_local_only@postgres:5432/orders?sslmode=disable
+      SOUQ_CONSUMER_GROUP: order-service.saga-events
+      # Tight locally so a saga timeout is observable in a demo rather than
+      # something you have to wait two minutes to see.
+      SOUQ_SWEEPER_INTERVAL: 2s
+      SOUQ_OUTBOX_POLL_INTERVAL: 100ms
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  inventory-service:
+    <<: *service-defaults
+    # Root context: the Go module has a `replace` pointing at
+    # libs/go-modelcheck, which has to be inside the build context.
+    build:
+      context: .
+      dockerfile: services/inventory-service/Dockerfile
+    container_name: souq-inventory
+    ports: ["8085:8085"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: "0.0.0.0:8085"
+      SOUQ_DB_URL: postgres://souq:souq_local_only@postgres:5432/inventory
+      SOUQ_SWEEP_INTERVAL_S: "10"
+      SOUQ_OUTBOX_POLL_MS: "100"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  payment-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/payment-service/Dockerfile
+    container_name: souq-payment
+    ports: ["8086:8086"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: ":8086"
+      SOUQ_DB_URL: postgres://souq:souq_local_only@postgres:5432/payments?sslmode=disable
+      SOUQ_PSP_PROVIDER: mock
+      # Local-only value, but still 32+ chars so the service exercises the
+      # same validation path it will in production.
+      SOUQ_PSP_KEY_SALT: local-development-salt-not-a-secret-value
+      # The mock provider declines this fraction of authorizations, so the
+      # compensation path is exercised by ordinary local use rather than only
+      # by a test nobody runs.
+      SOUQ_MOCK_DECLINE_RATE: "0.1"
+      SOUQ_MOCK_LATENCY_MS: "150"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  search-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/search-service/Dockerfile
+    container_name: souq-search
+    ports: ["8087:8087"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: "0.0.0.0:8087"
+      SOUQ_ELASTICSEARCH_URL: http://elasticsearch:9200
+      SOUQ_CATALOG_URL: http://catalog-service:8082
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  recommendation-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/recommendation-service/Dockerfile
+    container_name: souq-recommendation
+    ports: ["8088:8088"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: "0.0.0.0:8088"
+      SOUQ_REDIS_URL: redis://redis:6379/2
+      # Empty: no Personalize locally, so the service runs its fallback
+      # ranker. That is the point — see the localstack comment above.
+      SOUQ_PERSONALIZE_CAMPAIGN_ARN: ""
+      SOUQ_FALLBACK_ONLY: "true"
+    depends_on:
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  pricing-engine:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/pricing-engine/Dockerfile
+    container_name: souq-pricing
+    ports:
+      - "8089:8089"   # health + metrics
+      - "9089:9089"   # gRPC
+    environment:
+      <<: *common-env
+      SOUQ_GRPC_ADDR: "0.0.0.0:9089"
+      SOUQ_HTTP_ADDR: "0.0.0.0:8089"
+      SOUQ_REDIS_URL: redis://redis:6379/3
+      SOUQ_RULES_PATH: /etc/souq/rules.json
+    volumes:
+      - ./services/pricing-engine/rules/rules.json:/etc/souq/rules.json:ro
+    depends_on:
+      redis: { condition: service_healthy }
+    profiles: [services]
+
+  review-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/review-service/Dockerfile
+    container_name: souq-review
+    ports: ["8090:8090"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: "0.0.0.0:8090"
+      SOUQ_MONGO_URL: mongodb://souq:souq_local_only@mongodb:27017/reviews?authSource=admin
+    depends_on:
+      mongodb: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  notification-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    container_name: souq-notification
+    ports: ["8091:8091"]
+    environment:
+      <<: *common-env
+      SOUQ_HTTP_ADDR: "0.0.0.0:8091"
+      SOUQ_CASSANDRA_HOSTS: cassandra:9042
+      SOUQ_CASSANDRA_KEYSPACE: notifications
+      SOUQ_SES_ENDPOINT: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: eu-west-1
+    depends_on:
+      cassandra: { condition: service_healthy }
+      localstack: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    profiles: [services]
+
+  # ===========================================================================
+  # Frontends
+  # ===========================================================================
+
+  storefront:
+    <<: *service-defaults
+    build:
+      # Root context: the app depends on libs/ts-contracts and a build context
+      # cannot reach above itself.
+      context: .
+      dockerfile: apps/storefront/Dockerfile
+      target: dev
+    container_name: souq-storefront
+    ports: ["3000:3000"]
+    environment:
+      <<: *common-env
+      NODE_ENV: development
+      # Server-side only. The browser never talks to a service directly; it
+      # goes through the BFF route handlers (docs/CONTRACTS.md §8), which is
+      # what keeps tokens out of JavaScript and lets one Zod schema guard
+      # every response.
+      SOUQ_CATALOG_URL: http://catalog-service:8082
+      SOUQ_CART_URL: http://cart-service:8083
+      SOUQ_ORDER_URL: http://order-service:8084
+      SOUQ_SEARCH_URL: http://search-service:8087
+      SOUQ_RECOMMENDATION_URL: http://recommendation-service:8088
+      SOUQ_IDENTITY_URL: http://identity-service:8081
+      SOUQ_REVIEW_URL: http://review-service:8090
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+    volumes:
+      - ./apps/storefront:/app
+      - /app/node_modules
+      - /app/.next
+    profiles: [frontend]
+
+  admin:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: apps/admin/Dockerfile
+      target: dev
+    container_name: souq-admin
+    ports: ["3001:3001"]
+    environment:
+      <<: *common-env
+      NODE_ENV: development
+      PORT: "3001"
+      SOUQ_CATALOG_URL: http://catalog-service:8082
+      SOUQ_ORDER_URL: http://order-service:8084
+      SOUQ_INVENTORY_URL: http://inventory-service:8085
+      SOUQ_PAYMENT_URL: http://payment-service:8086
+      SOUQ_IDENTITY_URL: http://identity-service:8081
+      # Declared in admin-api.ts's service map; without these two an admin
+      # search or review lookup fails with "not configured" rather than with
+      # anything that points at the cause.
+      SOUQ_SEARCH_URL: http://search-service:8087
+      SOUQ_REVIEW_URL: http://review-service:8090
+      NEXT_PUBLIC_STOREFRONT_URL: http://localhost:3000
+    volumes:
+      - ./apps/admin:/app
+      - /app/node_modules
+      - /app/.next
+    profiles: [frontend]

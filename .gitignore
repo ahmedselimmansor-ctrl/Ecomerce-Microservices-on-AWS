@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------- dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# ---------------------------------------------------------------- build output
+dist/
+build/
+target/
+.next/
+out/
+*.jar
+*.class
+*.o
+*.a
+*.so
+
+# C++ build trees. `build*/` rather than `build/` because CMake
+# out-of-source directories get suffixed (build-grpc, build-san).
+build*/
+
+# ------------------------------------------------------------------ toolchains
+.gradle/
+.mvn/wrapper/maven-wrapper.jar
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ----------------------------------------------------------------------- local
+.env
+.env.*
+!.env.example
+*.local
+
+# Terraform state holds resource attributes and, for some providers,
+# secrets in plain text. It belongs in an S3 backend, never in git.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+
+# ------------------------------------------------------------------- editor/OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ------------------------------------------------------------------- artefacts
+coverage/
+*.log
+*.tsbuildinfo
+.eslintcache
+
+# Credentials, in every shape a tool tends to write them.
+*.pem
+*.key
+!**/testdata/*.key
+*.p12
+*.pfx
+id_rsa*
+.aws/
+kubeconfig

@@ -1,0 +1,215 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart-service
+  namespace: souq
+  labels:
+    app.kubernetes.io/name: cart-service
+    app.kubernetes.io/component: cart
+    app.kubernetes.io/part-of: souq
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never dip below the declared count during a deploy. Surging is cheaper
+      # than losing capacity mid-rollout.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cart-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cart-service
+        app.kubernetes.io/component: cart
+        app.kubernetes.io/part-of: souq
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8083"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: cart-service      # IRSA — no static AWS credentials
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      # Spread across AZs so losing one does not lose the service.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cart-service
+      containers:
+        - name: cart-service
+          image: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/cart-service:GIT_SHA
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8083, protocol: TCP }
+          env:
+            - name: SOUQ_ENV
+              value: production
+            - name: SOUQ_HTTP_ADDR
+              value: "0.0.0.0:8083"
+            - name: SOUQ_KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: kafka.brokers }
+            - name: SOUQ_JWKS_URL
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: jwks.url }
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: otel.endpoint }
+            - name: OTEL_SERVICE_NAME
+              value: cart-service
+            - name: SOUQ_REDIS_URL
+              valueFrom:
+                secretKeyRef: { name: cart-service-redis, key: url }
+            - name: SOUQ_PRICING_GRPC
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: pricing.grpc }
+            - name: NODE_OPTIONS
+              value: "--enable-source-maps --max-old-space-size=768"
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            # No CPU limit: throttling a latency-sensitive service at the p99
+            # does more harm than the noisy-neighbour risk it prevents. Memory
+            # IS limited, because a leak must be contained.
+            limits: { memory: 1Gi }
+          startupProbe:
+            # Covers slow first-boot work without making liveness lenient forever.
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            # Never touches a dependency. A probe a database blip can fail
+            # restarts every pod at once and turns a brownout into an outage.
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              # Let the ALB deregister this target before the process stops
+              # accepting. Without it every deploy drops in-flight requests.
+              exec: { command: ["/bin/sleep", "5"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cart-service
+  namespace: souq
+  labels:
+    app.kubernetes.io/name: cart-service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cart-service
+  ports:
+    - { name: http, port: 8083, targetPort: http, protocol: TCP }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cart-service
+  namespace: souq
+spec:
+  # minAvailable, not maxUnavailable: it keeps its meaning when the HPA scales
+  # the deployment underneath it.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cart-service
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cart-service
+  namespace: souq
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cart-service
+  minReplicas: 3
+  maxReplicas: 24
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 65 }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+    scaleDown:
+      # Slow. Scaling in during a lull right before the next burst is how you
+      # get a cold-start stampede.
+      stabilizationWindowSeconds: 300
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 60 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cart-service
+  namespace: souq
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cart-service
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: api-gateway }
+        - podSelector:
+            matchLabels: { app.kubernetes.io/part-of: souq }
+      ports:
+        - { protocol: TCP, port: 8083 }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: observability }
+      ports:
+        - { protocol: TCP, port: 8083 }
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Explicitly enumerated, so a compromised pod cannot exfiltrate to an
+    # arbitrary endpoint.
+    - to:
+        - ipBlock: { cidr: 10.0.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 4317 }
+        - { protocol: TCP, port: 6379 }
+        - { protocol: TCP, port: 8082 }
+        - { protocol: TCP, port: 9089 }
+        - { protocol: TCP, port: 9098 }
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/part-of: souq }

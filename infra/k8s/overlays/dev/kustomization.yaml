@@ -1,0 +1,91 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namePrefix: ""
+nameSuffix: ""
+
+# Dev runs a single replica of everything and no PDB. A PodDisruptionBudget
+# with minAvailable on a single-replica deployment blocks every node drain,
+# which makes cluster maintenance impossible.
+patches:
+  - target:
+      kind: Deployment
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target:
+      kind: PodDisruptionBudget
+    patch: |
+      - op: replace
+        path: /spec/minAvailable
+        value: 0
+  - target:
+      kind: HorizontalPodAutoscaler
+    patch: |
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 3
+
+configMapGenerator:
+  - name: souq-platform
+    behavior: merge
+    literals:
+      - environment=development
+
+images:
+  # Dev pulls from ghcr rather than ECR — it is a cheaper registry for a cluster
+  # nobody bills, and it keeps dev deployable without AWS credentials.
+  #
+  # The tag stays GIT_SHA. `latest` was here for one service, which is worse
+  # than it looks: two pods claiming the same "version" can be running
+  # different code, `kubectl rollout undo` has nothing to roll back to, and a
+  # bug reproduced on dev cannot be pinned to a commit. Dev is where people
+  # debug; it is the last place that should be ambiguous about what is running.
+  #
+  # CI substitutes GIT_SHA in both overlays, so the two differ only in registry.
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/cart-service
+    newName: ghcr.io/souq/cart-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/catalog-service
+    newName: ghcr.io/souq/catalog-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/identity-service
+    newName: ghcr.io/souq/identity-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/inventory-service
+    newName: ghcr.io/souq/inventory-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/notification-service
+    newName: ghcr.io/souq/notification-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/order-service
+    newName: ghcr.io/souq/order-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/payment-service
+    newName: ghcr.io/souq/payment-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/pricing-engine
+    newName: ghcr.io/souq/pricing-engine
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/recommendation-service
+    newName: ghcr.io/souq/recommendation-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/review-service
+    newName: ghcr.io/souq/review-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/search-service
+    newName: ghcr.io/souq/search-service
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/storefront
+    newName: ghcr.io/souq/storefront
+    newTag: GIT_SHA
+  - name: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/admin
+    newName: ghcr.io/souq/admin
+    newTag: GIT_SHA

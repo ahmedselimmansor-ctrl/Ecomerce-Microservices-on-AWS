@@ -1,0 +1,15 @@
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+elasticsearch[async]==8.15.1
+aiokafka==0.11.0
+pydantic==2.9.2
+# The platform contract, as Pydantic models. A local path rather than an index
+# package: it is versioned with the services that use it, and a release cycle
+# between editing a schema and seeing the error would mean nobody edits it.
+-e ../../libs/py-contracts
+pydantic-settings==2.6.1
+asyncpg==0.30.0
+prometheus-client==0.21.0
+python-json-logger==2.0.7
+opentelemetry-instrumentation-fastapi==0.49b0
+opentelemetry-exporter-otlp==1.28.0

@@ -1,0 +1,252 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: souq
+  labels:
+    app.kubernetes.io/name: order-service
+    app.kubernetes.io/component: saga-orchestrator
+    app.kubernetes.io/part-of: souq
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never go below the declared replica count during a deploy. Checkout is
+      # the revenue path; surging is cheaper than reducing capacity mid-rollout.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: order-service
+        app.kubernetes.io/component: saga-orchestrator
+        app.kubernetes.io/part-of: souq
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8084"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: order-service      # IRSA: MSK IAM auth, no static creds
+      terminationGracePeriodSeconds: 45      # > SOUQ_SHUTDOWN_GRACE + LB dereg delay
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread across AZs so losing one does not lose the saga orchestrator.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: order-service
+
+      containers:
+        - name: order-service
+          image: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/order-service:GIT_SHA
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - { name: http, containerPort: 8084, protocol: TCP }
+
+          env:
+            - name: SOUQ_ENV
+              value: production
+            - name: SOUQ_HTTP_ADDR
+              value: ":8084"
+            - name: SOUQ_VERSION
+              valueFrom:
+                fieldRef:
+                  # Block style: in a flow mapping the `[` of
+                  # labels['...'] opens a flow sequence and the document
+                  # fails to parse.
+                  fieldPath: "metadata.labels['app.kubernetes.io/version']"
+            - name: SOUQ_KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: kafka.brokers }
+            - name: SOUQ_JWKS_URL
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: jwks.url }
+            # Injected by External Secrets from AWS Secrets Manager. The value
+            # is never in git, never in a ConfigMap, and rotates without a
+            # deploy because the secret is remounted and the pool reconnects.
+            - name: SOUQ_DB_URL
+              valueFrom:
+                secretKeyRef: { name: order-service-db, key: url }
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://adot-collector.observability:4317
+            - name: OTEL_SERVICE_NAME
+              value: order-service
+            # Let the Go runtime size itself to the cgroup rather than to the
+            # node. Without this, GOMAXPROCS on a 64-core node is 64 for a pod
+            # limited to 1 core, and the scheduler thrashes.
+            - name: GOMAXPROCS
+              valueFrom:
+                resourceFieldRef: { resource: limits.cpu }
+            - name: GOMEMLIMIT
+              value: "900MiB"   # ~90% of the memory limit; leaves GC headroom
+
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            # No CPU limit deliberately: throttling a latency-sensitive Go
+            # service at the p99 does more harm than the noisy-neighbour risk
+            # it prevents. Memory IS limited, because a leak must be contained.
+            limits: { memory: 1Gi }
+
+          startupProbe:
+            # Covers slow first-boot work (pool warmup, JWKS prime) without
+            # making the liveness probe lenient forever.
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+
+          livenessProbe:
+            # Never touches a dependency. A database blip must not restart
+            # every pod at once and turn a brownout into an outage.
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+
+          lifecycle:
+            preStop:
+              # Give the ALB time to deregister this target before the process
+              # starts refusing connections. Without it, every deploy drops a
+              # handful of in-flight checkouts.
+              exec: { command: ["/bin/sleep", "5"] }
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: souq
+  labels:
+    app.kubernetes.io/name: order-service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: order-service
+  ports:
+    - { name: http, port: 8084, targetPort: http, protocol: TCP }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service
+  namespace: souq
+spec:
+  # minAvailable, not maxUnavailable: it keeps its meaning if the HPA scales
+  # the deployment up or down underneath it.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-service
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+  namespace: souq
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 65 }
+    # Scale on the actual work queue, not just CPU. The relay and consumer are
+    # I/O bound, so a backlog builds long before CPU moves — by which point
+    # customers are already waiting.
+    - type: Pods
+      pods:
+        metric: { name: souq_outbox_unpublished }
+        target: { type: AverageValue, averageValue: "500" }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+    scaleDown:
+      # Slow down. Scaling in aggressively during a lull, right before the next
+      # burst, is how you get a cold-start stampede.
+      stabilizationWindowSeconds: 300
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 60 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: order-service
+  namespace: souq
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: order-service
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Only the gateway and the observability scraper may reach this service.
+    # Nothing else in the mesh has any business calling it directly.
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: api-gateway }
+      ports:
+        - { protocol: TCP, port: 8084 }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: observability }
+      ports:
+        - { protocol: TCP, port: 8084 }
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Aurora, MSK, and the OTLP collector. Explicitly enumerated so a
+    # compromised pod cannot exfiltrate to an arbitrary endpoint.
+    - to:
+        - ipBlock: { cidr: 10.0.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 5432 }
+        - { protocol: TCP, port: 9098 }
+        - { protocol: TCP, port: 4317 }
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: identity-service }
+      ports:
+        - { protocol: TCP, port: 8081 }

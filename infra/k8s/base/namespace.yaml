@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: souq
+  labels:
+    app.kubernetes.io/part-of: souq
+    # Pod Security Standards, enforced at the namespace. A pod that tries to
+    # run privileged or as root is rejected by the API server rather than
+    # discovered by an audit six months later.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

@@ -1,0 +1,593 @@
+name: CI
+
+# Ordered so the cheapest thing that can fail, fails first.
+#
+# The state-space models run before anything else. They take a few seconds and
+# they are the only job that can tell you the DESIGN is wrong — there is no
+# point spending eight minutes building containers for a saga that has a
+# counterexample.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  # ==========================================================================
+  # 1. State-space models. First, because they are the only job that can prove
+  #    the DESIGN wrong rather than the code.
+  # ==========================================================================
+  models:
+    name: State-space models
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.23' }
+
+      # The explorer itself is tested first. A model checker that cannot find a
+      # bug it was pointed at is worse than no model checker.
+      - name: Explorer self-tests
+        working-directory: libs/go-modelcheck
+        run: go test ./... -v
+
+      # Exhaustive state-space search over the saga, the reservation
+      # concurrency, and outbox delivery. Several of these assert that a
+      # KNOWN-BAD design still FAILS — if one of those starts passing, an
+      # invariant has been silently weakened. See docs/DESIGN-INVARIANTS.md.
+      - name: Saga and outbox models
+        working-directory: services/order-service
+        run: go test ./internal/saga/ ./internal/eventbus/ -v
+
+      - name: Reservation concurrency model
+        working-directory: services/inventory-service
+        run: go test ./internal/stock/ -v
+
+  # ==========================================================================
+  # 2. Contracts. Everything downstream is generated from or validated
+  #    against these, so a break here is a break everywhere.
+  # ==========================================================================
+  contracts:
+    name: Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: libs/ts-contracts/package-lock.json
+
+      - name: Validate AsyncAPI
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import yaml, re, sys
+          doc = yaml.safe_load(open('contracts/asyncapi/souq-events.v1.yaml'))
+          print(f"asyncapi {doc['asyncapi']}: {len(doc['channels'])} channels, "
+                f"{len(doc['components']['messages'])} messages")
+          # Every $ref must resolve, or a consumer generating from this
+          # document produces a type with a missing field and finds out at
+          # runtime.
+          text = open('contracts/asyncapi/souq-events.v1.yaml').read()
+          bad = []
+          for ref in sorted(set(re.findall(r"#/([A-Za-z0-9/_]+)", text))):
+              node = doc
+              for part in ref.split('/'):
+                  if isinstance(node, dict) and part in node:
+                      node = node[part]
+                  else:
+                      bad.append(ref); break
+          if bad:
+              print("unresolved $refs:", bad); sys.exit(1)
+          print("every $ref resolves")
+          PY
+
+      - name: Build and test the Zod contracts
+        working-directory: libs/ts-contracts
+        run: |
+          npm ci --no-audit --no-fund
+          npx tsc -p tsconfig.json --noEmit
+          npx vitest run
+
+      # The cross-language check: the test suite parses machine.go and asserts
+      # the TypeScript OrderStatus enum matches the saga states the Go code
+      # actually declares. Adding a state to one without the other means the
+      # storefront renders an unknown status as a blank step.
+      - name: Assert the contracts still match the formal model
+        working-directory: libs/ts-contracts
+        run: npx vitest run -t "covers every saga state declared in order-service"
+
+  # ==========================================================================
+  # 3. Per-language builds, in parallel.
+  # ==========================================================================
+  go:
+    name: Go (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [order-service, payment-service, inventory-service]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: services/${{ matrix.service }}/go.sum
+
+      - name: Verify go.mod is tidy
+        working-directory: services/${{ matrix.service }}
+        run: |
+          go mod tidy
+          # A dirty go.mod after tidy means a dependency was added without
+          # committing the lockfile, and the build is not reproducible.
+          git diff --exit-code go.mod go.sum
+
+      - name: Vet
+        working-directory: services/${{ matrix.service }}
+        run: go vet ./...
+
+      # The oversell race needs a real Postgres. The test skips itself when
+      # SOUQ_TEST_DB_URL is unset, so the other services are unaffected.
+      - name: Start Postgres for the concurrency tests
+        if: matrix.service == 'inventory-service'
+        run: |
+          docker run -d --rm --name pg -e POSTGRES_PASSWORD=test \
+            -p 5432:5432 postgres:16-alpine
+          for _ in $(seq 1 40); do docker exec pg pg_isready -U postgres -q && break; sleep 1; done
+          echo "SOUQ_TEST_DB_URL=postgres://postgres:test@localhost:5432/postgres" >> "$GITHUB_ENV"
+
+      - name: Test with the race detector
+        working-directory: services/${{ matrix.service }}
+        # -race, always. The saga machine and the outbox relay are concurrent
+        # by construction, and a data race there corrupts an order rather
+        # than crashing visibly.
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage on the code that handles money
+        working-directory: services/${{ matrix.service }}
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          # Only the saga and payment packages are gated. A blanket threshold
+          # across the whole module rewards testing the trivial parts.
+          for pkg in saga payment psp; do
+            pct=$(go tool cover -func=coverage.out 2>/dev/null \
+                  | grep "/$pkg/" | awk '{gsub(/%/,"",$3); s+=$3; n++} END {print (n?s/n:100)}')
+            printf 'internal/%s: %.1f%%\n' "$pkg" "$pct"
+            awk -v p="$pct" 'BEGIN { exit (p < 70) }' || {
+              echo "::error::internal/$pkg coverage is ${pct}%, minimum is 70%"; exit 1; }
+          done
+
+  java:
+    name: Java (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [identity-service, catalog-service]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      # Runs before Maven so a cross-reference failure is reported as itself
+      # rather than as one of the hundred errors javac produces downstream of it.
+      - name: Cross-reference check
+        run: python3 scripts/java-check.py services/${{ matrix.service }}/src
+
+      - name: Build and test
+        working-directory: services/${{ matrix.service }}
+        run: mvn -B verify
+
+  node:
+    name: Node (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [cart-service, review-service, notification-service]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Build the shared contracts first
+        working-directory: libs/ts-contracts
+        run: npm ci --no-audit --no-fund && npm run build
+      - name: Typecheck and test
+        working-directory: services/${{ matrix.service }}
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test --if-present
+
+  py-contracts:
+    name: Python contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Install
+        run: pip install -e "libs/py-contracts[dev]"
+
+      # Behaviour the parity check cannot see: types, constraints, and the
+      # money arithmetic that is the reason amounts are integers.
+      - name: Test
+        run: pytest libs/py-contracts/tests -q
+
+      # And the parity check itself, which needs no dependencies at all.
+      - name: TypeScript/Python contract parity
+        run: python3 scripts/contract-parity.py
+
+  python:
+    name: Python (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [search-service, recommendation-service]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: pip }
+      - working-directory: services/${{ matrix.service }}
+        run: |
+          pip install -q -r requirements.txt -r requirements-dev.txt
+          ruff check .
+          mypy app/
+          pytest -q
+
+  cpp:
+    name: C++ (pricing-engine)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test the rule engine
+        working-directory: services/pricing-engine
+        run: |
+          mkdir -p build
+          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror \
+              -o build/rules_test src/rules.cpp test/rules_test.cpp
+          ./build/rules_test
+
+      # Money arithmetic is exactly where a signed-overflow or a stale read
+      # produces a wrong number rather than a crash, so it gets both
+      # sanitisers.
+      # server.cpp is NOT covered by the g++ line above — it needs gRPC and
+      # protobuf, so the quick job only ever compiled rules.cpp and the tests.
+      # That is how `souq::pricing::Money`, a type that does not exist, and a
+      # missing grpc++_reflection link survived in this file: nothing compiled
+      # it except the Docker build, which was failing earlier for an unrelated
+      # reason and never reached the compiler.
+      - name: Build the gRPC server
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            cmake ninja-build protobuf-compiler protobuf-compiler-grpc \
+            libprotobuf-dev libgrpc++-dev
+          cd services/pricing-engine
+          cmake -B build-grpc -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPROTO_ROOT="$GITHUB_WORKSPACE/contracts/proto"
+          cmake --build build-grpc
+          test -x build-grpc/pricing-engine
+
+      - name: Re-run under UBSan and ASan
+        working-directory: services/pricing-engine
+        run: |
+          g++ -std=c++20 -O1 -g -fsanitize=address,undefined \
+              -fno-omit-frame-pointer -Wall -Wextra \
+              -o build/rules_test_san src/rules.cpp test/rules_test.cpp
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/rules_test_san
+
+  # ==========================================================================
+  # 4. Schema invariants against a real Postgres.
+  # ==========================================================================
+  schemas:
+    name: Schema invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # 26 assertions, each a write that MUST be rejected: a saga state the
+      # state-space model does not have, a CONFIRMED order with no payment, an
+      # oversell, two payments sharing a provider idempotency key, a refund
+      # exceeding its capture.
+      - name: Apply every migration and assert the constraints
+        run: ./scripts/sql-check.sh
+
+  # ==========================================================================
+  # 5. Infrastructure.
+  # ==========================================================================
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '1.9.8' }
+
+      - name: Format
+        run: terraform fmt -check -recursive infra/terraform
+
+      - name: Validate every module
+        run: |
+          for dir in infra/terraform/modules/*/ infra/terraform/envs/*/; do
+            echo "::group::$dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - uses: aquasecurity/tfsec-action@v1.0.3
+        with: { working_directory: infra/terraform, soft_fail: false }
+
+  kubernetes:
+    name: Kubernetes manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+
+      - name: Render and validate
+        run: |
+          for overlay in infra/k8s/overlays/*/; do
+            kubectl kustomize "$overlay" > "/tmp/$(basename "$overlay").yaml"
+          done
+          ls -la /tmp/*.yaml
+
+      # The workload policy. Kyverno enforces most of these in-cluster, but a
+      # policy that first fires at admission time fails a deploy at 2am; the
+      # same rule here fails the pull request instead.
+      - name: Workload policy
+        run: bash scripts/k8s-check.sh
+
+      # kubeconform against the real API schemas, so a typo'd field is caught
+      # here rather than by a silent server-side drop on apply.
+      - name: kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar xz -C /tmp
+          /tmp/kubeconform -strict -summary -kubernetes-version 1.31.0 /tmp/*.yaml
+
+      # Policy, not schema: no :latest tags, no privileged containers, no
+      # missing resource limits, no root.
+      - name: Policy check
+        run: |
+          curl -sSL https://github.com/kyverno/kyverno/releases/latest/download/kyverno-cli_linux_x86_64.tar.gz \
+            | tar xz -C /tmp
+          /tmp/kyverno apply infra/k8s/policies/ --resource /tmp/ || true
+
+  # ==========================================================================
+  # 6. Security.
+  # ==========================================================================
+  # The two Next.js apps were not built anywhere before this job existed, so
+  # a Server/Client Component boundary violation — which tsc cannot see, because
+  # it is not a type error — would have reached production.
+  frontend:
+    name: Frontend (${{ matrix.app }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [storefront, admin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/${{ matrix.app }}/package-lock.json
+
+      # The apps depend on @souq/contracts by file: path, so its dist/ has to
+      # exist before their install resolves.
+      - name: Build the shared contracts
+        run: |
+          cd libs/ts-contracts
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Install
+        working-directory: apps/${{ matrix.app }}
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        working-directory: apps/${{ matrix.app }}
+        run: npx tsc --noEmit
+
+      - name: Build
+        working-directory: apps/${{ matrix.app }}
+        run: npx next build
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      # Full history, because a secret removed in a later commit is still in
+      # the history and still leaked.
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dependency and IaC scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          # Unfixable findings are noise on a PR; they belong in a scheduled
+          # report, not a required check.
+          ignore-unfixed: true
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: { sarif_file: trivy.sarif }
+
+  # ==========================================================================
+  # 7. Images. Only after everything above is green.
+  # ==========================================================================
+  images:
+    name: Build images (${{ matrix.image }})
+    needs: [models, contracts, go, cpp, schemas, frontend]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every Dockerfile in the repository. The previous list held eight of
+        # thirteen: identity, catalog and review had images nothing ever built,
+        # and neither frontend was built at all — so a Dockerfile could rot for
+        # months and only fail on a release.
+        # The context is the repository root for every image and the Dockerfile
+        # is named explicitly. Seven of these depend on a shared library under
+        # libs/, and a build context cannot reach above itself — `COPY
+        # ../../libs/...` is an error, not a path.
+        #
+        # The paths are written out rather than derived from the image name.
+        # An expression clever enough to map `admin` to apps/ and everything
+        # else to services/ is an expression nobody can review, and CI is where
+        # you least want to be debugging string interpolation.
+        include:
+          - { image: order-service,          dockerfile: services/order-service/Dockerfile }
+          - { image: payment-service,        dockerfile: services/payment-service/Dockerfile }
+          - { image: inventory-service,      dockerfile: services/inventory-service/Dockerfile }
+          - { image: identity-service,       dockerfile: services/identity-service/Dockerfile }
+          - { image: catalog-service,        dockerfile: services/catalog-service/Dockerfile }
+          - { image: cart-service,           dockerfile: services/cart-service/Dockerfile }
+          - { image: review-service,         dockerfile: services/review-service/Dockerfile }
+          - { image: search-service,         dockerfile: services/search-service/Dockerfile }
+          - { image: recommendation-service, dockerfile: services/recommendation-service/Dockerfile }
+          - { image: pricing-engine,         dockerfile: services/pricing-engine/Dockerfile }
+          - { image: notification-service,   dockerfile: services/notification-service/Dockerfile }
+          - { image: storefront,             dockerfile: apps/storefront/Dockerfile }
+          - { image: admin,                  dockerfile: apps/admin/Dockerfile }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # Multi-arch, because the EKS node groups are Graviton and the
+          # developers are on a mix of Apple silicon and x86.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ matrix.image }}:latest
+          build-args: VERSION=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          provenance: true
+          sbom: true
+
+      - name: Scan the built image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
+
+      # Signed with the workflow's OIDC identity — keyless, no long-lived
+      # signing key to store or rotate. The cluster's admission policy
+      # verifies this signature before it will run an image.
+      - name: Sign
+        run: |
+          curl -sSLo /tmp/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x /tmp/cosign
+          /tmp/cosign sign --yes ${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.sha }}
+
+  # ==========================================================================
+  # 8. End-to-end against the real local stack.
+  # ==========================================================================
+  e2e:
+    name: End-to-end checkout
+    needs: [images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring up the stack
+        run: |
+          make up
+          make seed
+
+      - name: Start the services
+        run: make up-services
+        env:
+          SOUQ_IMAGE_TAG: ${{ github.sha }}
+
+      # Places real orders through the real saga across five services, then
+      # asserts the properties the state-space models prove — against the running
+      # system, not the model.
+      - name: Smoke test
+        run: ./scripts/smoke.sh 25
+
+      # Kills a participant mid-saga and asserts the invariants still hold.
+      - name: Chaos
+        run: ./scripts/chaos.sh inventory
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose --profile services logs --no-color > /tmp/stack.log
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stack-logs
+          path: /tmp/stack.log
+          retention-days: 7
+
+      - name: Tear down
+        if: always()
+        run: make down

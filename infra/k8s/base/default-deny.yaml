@@ -1,0 +1,34 @@
+# Default deny, both directions.
+#
+# Every service then opens exactly the paths it needs in its own
+# NetworkPolicy. Without this, adding a NetworkPolicy to one service does
+# nothing useful — Kubernetes policies are additive, so a pod with no policy
+# selecting it is wide open.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: souq
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# DNS is the one universal exception. Without it every pod fails to resolve
+# anything and the failure looks like a hundred unrelated bugs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: souq
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }

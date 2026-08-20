@@ -1,0 +1,62 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: souq
+
+resources:
+  - namespace.yaml
+  - default-deny.yaml
+  - services/cart-service.yaml
+  - services/catalog-service.yaml
+  - services/identity-service.yaml
+  - services/inventory-service.yaml
+  - services/notification-service.yaml
+  - services/order-service.yaml
+  - services/payment-service.yaml
+  - services/pricing-engine.yaml
+  - services/recommendation-service.yaml
+  - services/review-service.yaml
+  - services/search-service.yaml
+  - apps/storefront.yaml
+  - apps/admin.yaml
+
+# Deployable manifests live HERE, not next to each service. Kustomize refuses
+# to reference files outside its root, and that restriction is correct — a
+# base that can reach anywhere on disk is not reproducible. Each service's
+# README points here.
+
+# A generator rather than a plain resource, so overlays can `behavior: merge`
+# into it. A ConfigMap declared as a resource cannot be merged, only replaced
+# wholesale, which means every overlay has to restate every key.
+configMapGenerator:
+  - name: souq-platform
+    literals:
+      # Non-secret platform configuration only. Anything that would be a
+      # credential lives in Secrets Manager and arrives via ExternalSecret —
+      # never here, because a ConfigMap is readable by anything with
+      # namespace read access.
+      - kafka.brokers=PLACEHOLDER_MSK_BOOTSTRAP
+      - jwks.url=http://identity-service:8081/v1/.well-known/jwks.json
+      - jwt.issuer=https://auth.souq.dev
+      - jwt.audience=souq-api
+      # A KMS key ARN is an identifier, not a credential — it grants nothing on
+      # its own. Access is granted by the IRSA role attached to the pod, which
+      # is where the actual authorisation lives.
+      - jwt.kms.key.id=PLACEHOLDER_KMS_JWT_SIGNING_KEY_ARN
+      - site.url=https://souq.dev
+      - admin.url=https://admin.souq.dev
+      - otel.endpoint=http://adot-collector.observability:4317
+      - environment=production
+
+generatorOptions:
+  # The Deployment references this ConfigMap by name. A content hash suffix
+  # would break that reference — the usual reason to keep the hash (rolling
+  # pods on config change) does not apply when the value is read at startup
+  # and the pods are restarted deliberately.
+  disableNameSuffixHash: true
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: souq
+      app.kubernetes.io/managed-by: kustomize

@@ -1,0 +1,81 @@
+# Kyverno policies. These are the checks CI runs against rendered manifests,
+# and the same ones enforced in-cluster — so a violation fails the PR rather
+# than being discovered by an audit.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: souq-workload-baseline
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-mutable-tags
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [souq]
+      validate:
+        message: >-
+          Images must be pinned to an immutable tag. A mutable tag means two
+          pods in one ReplicaSet can run different code.
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
+
+    - name: require-resource-limits
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [souq]
+      validate:
+        message: >-
+          Every container needs a memory limit and a CPU request. Without a
+          memory limit one leak takes out the node; without a CPU request the
+          scheduler cannot bin-pack.
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests:
+                    cpu: "?*"
+                  limits:
+                    memory: "?*"
+
+    - name: require-probes
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [souq]
+      validate:
+        message: >-
+          Both probes are required. Without a readiness probe, traffic reaches
+          a pod before it can serve; without liveness, a wedged pod stays in
+          rotation forever.
+        pattern:
+          spec:
+            containers:
+              - livenessProbe:
+                  "?*": "?*"
+                readinessProbe:
+                  "?*": "?*"
+
+    - name: no-privileged
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [souq]
+      validate:
+        message: "No container in this platform needs privileged or root."
+        pattern:
+          spec:
+            =(securityContext):
+              =(runAsNonRoot): true
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+                  =(allowPrivilegeEscalation): "false"

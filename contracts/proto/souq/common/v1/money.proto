@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package souq.common.v1;
+
+option go_package   = "github.com/souq/contracts/gen/go/souq/common/v1;commonv1";
+option java_package = "dev.souq.contracts.common.v1";
+option java_multiple_files = true;
+
+// Money is always minor units. There is no float anywhere in this platform;
+// see docs/CONTRACTS.md §2.5.
+//
+// 129900 EUR == €1,299.00
+message Money {
+  // Amount in the smallest indivisible unit of `currency_code`. May be
+  // negative (discounts, refunds, credit notes).
+  int64 amount = 1;
+
+  // ISO-4217 alphabetic code, uppercase. "EUR", "USD", "EGP".
+  string currency_code = 2;
+}
+
+// A decimal fraction expressed as basis points, so tax and discount rates are
+// exact integers too. 1900 == 19.00%.
+message BasisPoints {
+  int32 value = 1;
+}
+
+message Error {
+  // Stable machine identifier, SCREAMING_SNAKE_CASE. Clients switch on this.
+  string code = 1;
+  string message = 2;
+  string request_id = 3;
+  map<string, string> metadata = 4;
+}

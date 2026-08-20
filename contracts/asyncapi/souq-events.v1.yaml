@@ -1,0 +1,669 @@
+asyncapi: 3.0.0
+
+info:
+  title: SOUQ Event Backbone
+  version: 1.0.0
+  description: |
+    Every Kafka message on every SOUQ topic, as a machine-readable contract.
+
+    This document is generated into three artefacts and none of them are hand-written:
+      * `libs/ts-contracts`     — Zod schemas + TS types (frontends, Node services)
+      * `libs/py-contracts`     — Pydantic models (Python services)
+      * `contracts/gen/go`      — Go structs (Go services)
+    The Java services validate against the JSON Schemas in `components.schemas`
+    at consumer-group startup, so a schema drift fails the pod's readiness probe
+    rather than a customer's order.
+
+    Two rules that are not expressible in AsyncAPI but are part of this contract:
+      1. Every message value is a CloudEvents 1.0 structured envelope. `payload`
+         below describes the CONTENTS of `data`, not the whole message.
+      2. Delivery is at-least-once and ordering is per-key only. Every consumer
+         MUST implement the `processed_events` inbox (docs/CONTRACTS.md §5.2).
+  license:
+    name: Proprietary
+
+defaultContentType: application/json
+
+servers:
+  msk-prod:
+    host: b-1.souq-prod.kafka.eu-west-1.amazonaws.com:9098
+    protocol: kafka-secure
+    description: Amazon MSK, IAM SASL auth, TLS in transit
+    security:
+      - $ref: '#/components/securitySchemes/mskIam'
+  local:
+    host: localhost:9092
+    protocol: kafka
+    description: docker compose (KRaft, single broker, no auth)
+
+channels:
+  orderEvents:
+    address: souq.order.events.v1
+    description: Order lifecycle facts. 12 partitions, keyed by orderId, 30d retention.
+    messages:
+      orderCreated:   { $ref: '#/components/messages/OrderCreated' }
+      orderConfirmed: { $ref: '#/components/messages/OrderConfirmed' }
+      orderCancelled: { $ref: '#/components/messages/OrderCancelled' }
+      orderShipped:   { $ref: '#/components/messages/OrderShipped' }
+
+  orderCommands:
+    address: souq.order.commands.v1
+    description: |
+      Saga commands from the orchestrator to its participants. Keyed by orderId
+      so a participant sees one order's commands in order — which is what makes
+      the release-overtakes-reserve tombstone (docs/DESIGN-INVARIANTS.md §2) a
+      cross-partition concern only.
+    messages:
+      inventoryReserve: { $ref: '#/components/messages/InventoryReserve' }
+      inventoryRelease: { $ref: '#/components/messages/InventoryRelease' }
+      inventoryCommit:  { $ref: '#/components/messages/InventoryCommit' }
+      paymentAuthorize: { $ref: '#/components/messages/PaymentAuthorize' }
+      paymentCapture:   { $ref: '#/components/messages/PaymentCapture' }
+      paymentVoid:      { $ref: '#/components/messages/PaymentVoid' }
+
+  inventoryEvents:
+    address: souq.inventory.events.v1
+    description: Reservation outcomes and stock movements. Keyed by sku.
+    messages:
+      reserved:         { $ref: '#/components/messages/InventoryReserved' }
+      reservationFailed: { $ref: '#/components/messages/InventoryReservationFailed' }
+      released:         { $ref: '#/components/messages/InventoryReleased' }
+      committed:        { $ref: '#/components/messages/InventoryCommitted' }
+      stockChanged:     { $ref: '#/components/messages/StockChanged' }
+
+  paymentEvents:
+    address: souq.payment.events.v1
+    description: Payment outcomes. 90d retention — this is the reconciliation source.
+    messages:
+      authorized: { $ref: '#/components/messages/PaymentAuthorized' }
+      failed:     { $ref: '#/components/messages/PaymentFailed' }
+      captured:   { $ref: '#/components/messages/PaymentCaptured' }
+      voided:     { $ref: '#/components/messages/PaymentVoided' }
+      refunded:   { $ref: '#/components/messages/PaymentRefunded' }
+
+  catalogEvents:
+    address: souq.catalog.events.v1
+    description: |
+      Log-compacted product projection. Because it is compacted and keyed by
+      productId, a new consumer can rebuild full state from offset 0 — this is
+      how search-service reindexes and how the storefront read model is seeded.
+    messages:
+      productUpserted: { $ref: '#/components/messages/ProductUpserted' }
+      productDeleted:  { $ref: '#/components/messages/ProductDeleted' }
+
+  userActivity:
+    address: souq.user.activity.v1
+    description: |
+      Behavioural stream. 24 partitions keyed by userId. Consumed by
+      recommendation-service and mirrored to S3 by Firehose for Amazon
+      Personalize dataset imports. Contains no PII beyond the pseudonymous id.
+    messages:
+      activity: { $ref: '#/components/messages/UserActivity' }
+
+  notificationCommands:
+    address: souq.notification.commands.v1
+    description: Fan-out target for anything that should reach a human.
+    messages:
+      notify: { $ref: '#/components/messages/NotificationCommand' }
+
+operations:
+  publishOrderEvents:
+    action: send
+    channel: { $ref: '#/channels/orderEvents' }
+    description: order-service, via transactional outbox relay.
+
+  consumeOrderEventsForNotification:
+    action: receive
+    channel: { $ref: '#/channels/orderEvents' }
+    description: notification-service, group `notification-service.order-events`.
+
+  consumeOrderEventsForSearch:
+    action: receive
+    channel: { $ref: '#/channels/catalogEvents' }
+    description: search-service, group `search-service.catalog-indexer`.
+
+  consumeCommandsInventory:
+    action: receive
+    channel: { $ref: '#/channels/orderCommands' }
+    description: |
+      inventory-service, group `inventory-service.saga-commands`. Filters on
+      the CloudEvents `type` header; ignores payment.* without deserialising.
+
+  consumeCommandsPayment:
+    action: receive
+    channel: { $ref: '#/channels/orderCommands' }
+    description: payment-service, group `payment-service.saga-commands`.
+
+  consumeParticipantEvents:
+    action: receive
+    channel: { $ref: '#/channels/inventoryEvents' }
+    description: order-service saga, group `order-service.saga-events`.
+
+components:
+  securitySchemes:
+    mskIam:
+      type: scramSha512
+      description: AWS_MSK_IAM SASL mechanism via IRSA; no static credentials exist.
+
+  schemas:
+    Money:
+      type: object
+      required: [amount, currency]
+      additionalProperties: false
+      properties:
+        amount:
+          type: integer
+          format: int64
+          description: Minor units. Never a decimal. 129900 == 1299.00
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+
+    OrderItem:
+      type: object
+      required: [sku, productId, quantity, unitPrice]
+      additionalProperties: false
+      properties:
+        sku:       { type: string, pattern: '^sku_[0-9A-HJKMNP-TV-Z]{26}$' }
+        productId: { type: string, pattern: '^prd_[0-9A-HJKMNP-TV-Z]{26}$' }
+        title:     { type: string, maxLength: 500 }
+        quantity:  { type: integer, minimum: 1, maximum: 999 }
+        unitPrice: { $ref: '#/components/schemas/Money' }
+        lineTotal: { $ref: '#/components/schemas/Money' }
+
+    Address:
+      type: object
+      required: [line1, city, countryCode, postalCode, recipient]
+      additionalProperties: false
+      properties:
+        recipient:   { type: string, maxLength: 200 }
+        line1:       { type: string, maxLength: 300 }
+        line2:       { type: string, maxLength: 300 }
+        city:        { type: string, maxLength: 150 }
+        region:      { type: string, maxLength: 150 }
+        postalCode:  { type: string, maxLength: 30 }
+        countryCode: { type: string, pattern: '^[A-Z]{2}$' }
+        phone:       { type: string, maxLength: 40 }
+
+    UnavailableSku:
+      type: object
+      required: [sku, requested, available]
+      additionalProperties: false
+      properties:
+        sku:       { type: string }
+        requested: { type: integer, minimum: 1 }
+        available: { type: integer, minimum: 0 }
+
+  messageTraits:
+    cloudEvent:
+      headers:
+        type: object
+        required: [ce_id, ce_type, ce_source, ce_time]
+        properties:
+          ce_id:         { type: string, description: ULID, globally unique, the inbox dedup key }
+          ce_type:       { type: string }
+          ce_source:     { type: string }
+          ce_time:       { type: string, format: date-time }
+          traceparent:   { type: string, description: W3C Trace Context, propagated across the broker }
+          correlationid: { type: string, description: ties an entire saga together }
+
+  messages:
+    # --------------------------------------------------------------- orders
+    OrderCreated:
+      name: souq.order.created.v1
+      title: Order accepted, saga started
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, userId, items, total, shippingAddress, rulesVersion]
+        additionalProperties: false
+        properties:
+          orderId:  { type: string, pattern: '^ord_[0-9A-HJKMNP-TV-Z]{26}$' }
+          userId:   { type: string }
+          items:
+            type: array
+            minItems: 1
+            maxItems: 100
+            items: { $ref: '#/components/schemas/OrderItem' }
+          subtotal:       { $ref: '#/components/schemas/Money' }
+          discountTotal:  { $ref: '#/components/schemas/Money' }
+          shippingTotal:  { $ref: '#/components/schemas/Money' }
+          taxTotal:       { $ref: '#/components/schemas/Money' }
+          total:          { $ref: '#/components/schemas/Money' }
+          shippingAddress: { $ref: '#/components/schemas/Address' }
+          rulesVersion:
+            type: string
+            description: |
+              Pricing rule set the totals were computed against. Recorded so the
+              order can be re-priced identically at capture time even if a
+              promotion expired in between.
+          idempotencyKey: { type: string, format: uuid }
+
+    OrderConfirmed:
+      name: souq.order.confirmed.v1
+      title: Saga reached CONFIRMED — stock committed and funds captured
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, userId, paymentId, reservationId, confirmedAt]
+        additionalProperties: false
+        properties:
+          orderId:       { type: string }
+          userId:        { type: string }
+          paymentId:     { type: string }
+          reservationId: { type: string }
+          total:         { $ref: '#/components/schemas/Money' }
+          confirmedAt:   { type: string, format: date-time }
+
+    OrderCancelled:
+      name: souq.order.cancelled.v1
+      title: Saga reached CANCELLED — everything compensated
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, userId, reasonCode]
+        additionalProperties: false
+        properties:
+          orderId: { type: string }
+          userId:  { type: string }
+          reasonCode:
+            type: string
+            enum:
+              - INSUFFICIENT_STOCK
+              - PAYMENT_DECLINED
+              - PAYMENT_TIMEOUT
+              - RESERVATION_TIMEOUT
+              - CUSTOMER_CANCELLED
+              - FRAUD_REJECTED
+          failedStep:
+            type: string
+            enum: [RESERVE, AUTHORIZE, COMMIT, CAPTURE, NONE]
+          unavailable:
+            type: array
+            items: { $ref: '#/components/schemas/UnavailableSku' }
+
+    OrderShipped:
+      name: souq.order.shipped.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, trackingNumber, carrier]
+        additionalProperties: false
+        properties:
+          orderId:        { type: string }
+          trackingNumber: { type: string }
+          carrier:        { type: string }
+          shippedAt:      { type: string, format: date-time }
+          estimatedDelivery: { type: string, format: date }
+
+    # ------------------------------------------------------- saga commands
+    InventoryReserve:
+      name: souq.inventory.reserve.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, reservationId, items, ttlSeconds]
+        additionalProperties: false
+        properties:
+          orderId:       { type: string }
+          reservationId: { type: string, pattern: '^rsv_[0-9A-HJKMNP-TV-Z]{26}$' }
+          items:
+            type: array
+            minItems: 1
+            items:
+              type: object
+              required: [sku, quantity]
+              additionalProperties: false
+              properties:
+                sku:      { type: string }
+                quantity: { type: integer, minimum: 1 }
+          ttlSeconds: { type: integer, default: 900 }
+
+    InventoryRelease:
+      name: souq.inventory.release.v1
+      description: |
+        MUST be handled even when the reservationId is unknown — write a
+        tombstone so a late Reserve for the same id is rejected.
+        See docs/DESIGN-INVARIANTS.md §2.
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, reservationId, reasonCode]
+        additionalProperties: false
+        properties:
+          orderId:       { type: string }
+          reservationId: { type: string }
+          reasonCode:    { type: string }
+
+    InventoryCommit:
+      name: souq.inventory.commit.v1
+      description: |
+        The point of no return. Once order-service emits this it will never
+        compensate; the only paths forward are success or an operator page.
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, reservationId]
+        additionalProperties: false
+        properties:
+          orderId:       { type: string }
+          reservationId: { type: string }
+
+    PaymentAuthorize:
+      name: souq.payment.authorize.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, paymentId, userId, amount, paymentMethodToken]
+        additionalProperties: false
+        properties:
+          orderId:   { type: string }
+          paymentId: { type: string, pattern: '^pay_[0-9A-HJKMNP-TV-Z]{26}$' }
+          userId:    { type: string }
+          amount:    { $ref: '#/components/schemas/Money' }
+          paymentMethodToken:
+            type: string
+            description: |
+              PSP-side token. Raw PAN never enters this platform — the browser
+              posts card details directly to the PSP and we only ever see this.
+          billingAddress: { $ref: '#/components/schemas/Address' }
+
+    PaymentCapture:
+      name: souq.payment.capture.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, paymentId]
+        additionalProperties: false
+        properties:
+          orderId:   { type: string }
+          paymentId: { type: string }
+          amount:    { $ref: '#/components/schemas/Money' }
+
+    PaymentVoid:
+      name: souq.payment.void.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, paymentId, reasonCode]
+        additionalProperties: false
+        properties:
+          orderId:    { type: string }
+          paymentId:  { type: string }
+          reasonCode: { type: string }
+
+    # ---------------------------------------------------- inventory events
+    InventoryReserved:
+      name: souq.inventory.reserved.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, reservationId, expiresAt]
+        additionalProperties: false
+        properties:
+          orderId:       { type: string }
+          reservationId: { type: string }
+          expiresAt:     { type: string, format: date-time }
+          items:
+            type: array
+            items:
+              type: object
+              additionalProperties: false
+              properties:
+                sku:      { type: string }
+                quantity: { type: integer }
+
+    InventoryReservationFailed:
+      name: souq.inventory.reservation_failed.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, reservationId, reasonCode]
+        additionalProperties: false
+        properties:
+          orderId:       { type: string }
+          reservationId: { type: string }
+          reasonCode:
+            type: string
+            enum: [INSUFFICIENT_STOCK, SKU_NOT_FOUND, SKU_DISCONTINUED, RESERVATION_TOMBSTONED]
+          unavailable:
+            type: array
+            items: { $ref: '#/components/schemas/UnavailableSku' }
+
+    InventoryReleased:
+      name: souq.inventory.released.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, reservationId]
+        additionalProperties: false
+        properties:
+          orderId:       { type: string }
+          reservationId: { type: string }
+          wasTombstone:
+            type: boolean
+            description: true when Release arrived before Reserve was ever processed
+
+    InventoryCommitted:
+      name: souq.inventory.committed.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, reservationId]
+        additionalProperties: false
+        properties:
+          orderId:       { type: string }
+          reservationId: { type: string }
+
+    StockChanged:
+      name: souq.inventory.stock_changed.v1
+      description: Drives the "only 3 left" badge and the low-stock alert.
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [sku, onHand, reserved, available]
+        additionalProperties: false
+        properties:
+          sku:       { type: string }
+          onHand:    { type: integer, minimum: 0 }
+          reserved:  { type: integer, minimum: 0 }
+          available: { type: integer, minimum: 0 }
+          reasonCode:
+            type: string
+            enum: [RESERVATION, RELEASE, COMMIT, RESTOCK, ADJUSTMENT, RETURN, SHRINKAGE]
+
+    # ------------------------------------------------------ payment events
+    PaymentAuthorized:
+      name: souq.payment.authorized.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, paymentId, amount, provider]
+        additionalProperties: false
+        properties:
+          orderId:   { type: string }
+          paymentId: { type: string }
+          amount:    { $ref: '#/components/schemas/Money' }
+          provider:  { type: string, enum: [stripe, adyen, checkout, mock] }
+          authCode:  { type: string }
+          expiresAt:
+            type: string
+            format: date-time
+            description: Authorisation window. Capture after this fails and needs a re-auth.
+
+    PaymentFailed:
+      name: souq.payment.failed.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, paymentId, reasonCode, retriable]
+        additionalProperties: false
+        properties:
+          orderId:     { type: string }
+          paymentId:   { type: string }
+          reasonCode:
+            type: string
+            enum:
+              - INSUFFICIENT_FUNDS
+              - CARD_DECLINED
+              - CARD_EXPIRED
+              - INVALID_CVC
+              - FRAUD_SUSPECTED
+              - THREE_DS_FAILED
+              - PROVIDER_UNAVAILABLE
+              - AUTHORIZATION_EXPIRED
+          declineCode: { type: string, description: raw PSP code, for support only }
+          retriable:
+            type: boolean
+            description: |
+              PROVIDER_UNAVAILABLE is retriable and the saga backs off.
+              CARD_DECLINED is not, and the saga compensates immediately.
+
+    PaymentCaptured:
+      name: souq.payment.captured.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, paymentId, amount]
+        additionalProperties: false
+        properties:
+          orderId:   { type: string }
+          paymentId: { type: string }
+          amount:    { $ref: '#/components/schemas/Money' }
+          capturedAt: { type: string, format: date-time }
+
+    PaymentVoided:
+      name: souq.payment.voided.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, paymentId]
+        additionalProperties: false
+        properties:
+          orderId:      { type: string }
+          paymentId:    { type: string }
+          wasTombstone: { type: boolean }
+
+    PaymentRefunded:
+      name: souq.payment.refunded.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [orderId, paymentId, refundId, amount]
+        additionalProperties: false
+        properties:
+          orderId:   { type: string }
+          paymentId: { type: string }
+          refundId:  { type: string }
+          amount:    { $ref: '#/components/schemas/Money' }
+          partial:   { type: boolean }
+          reasonCode: { type: string }
+
+    # ------------------------------------------------------ catalog events
+    ProductUpserted:
+      name: souq.catalog.product_upserted.v1
+      description: |
+        Full current state of the product, not a delta. Compaction relies on
+        this: the newest message for a key is sufficient to rebuild the entity.
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [productId, sku, title, status, price, updatedAt]
+        additionalProperties: false
+        properties:
+          productId:   { type: string }
+          sku:         { type: string }
+          title:       { type: string, maxLength: 500 }
+          description: { type: string, maxLength: 20000 }
+          brand:       { type: string }
+          categoryPath:
+            type: array
+            items: { type: string }
+            description: ordered root-to-leaf, e.g. ["electronics","audio","headphones"]
+          attributes:
+            type: object
+            additionalProperties: { type: string }
+          images:
+            type: array
+            items:
+              type: object
+              additionalProperties: false
+              properties:
+                url:    { type: string, format: uri }
+                alt:    { type: string }
+                width:  { type: integer }
+                height: { type: integer }
+          price:     { $ref: '#/components/schemas/Money' }
+          listPrice: { $ref: '#/components/schemas/Money' }
+          status:    { type: string, enum: [DRAFT, ACTIVE, ARCHIVED, DISCONTINUED] }
+          locale:    { type: string, default: en-GB }
+          updatedAt: { type: string, format: date-time }
+
+    ProductDeleted:
+      name: souq.catalog.product_deleted.v1
+      description: |
+        Emitted with a null `data` as a compaction tombstone as well, so the key
+        eventually disappears from the topic entirely.
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [productId]
+        additionalProperties: false
+        properties:
+          productId: { type: string }
+
+    # ------------------------------------------------------- user activity
+    UserActivity:
+      name: souq.activity.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [eventType, sessionId, occurredAt]
+        additionalProperties: false
+        properties:
+          eventType:
+            type: string
+            enum: [VIEW, ADD_TO_CART, REMOVE_FROM_CART, PURCHASE, SEARCH, WISHLIST, REVIEW]
+          userId:
+            type: string
+            description: absent for anonymous sessions; anonymousId is used instead
+          anonymousId: { type: string }
+          sessionId:   { type: string }
+          itemId:      { type: string, description: productId, for item-based events }
+          query:       { type: string, description: for SEARCH }
+          resultCount: { type: integer }
+          position:    { type: integer, description: rank of the item in the list that was clicked }
+          value:       { $ref: '#/components/schemas/Money' }
+          deviceType:  { type: string, enum: [desktop, mobile, tablet, app] }
+          locale:      { type: string }
+          occurredAt:  { type: string, format: date-time }
+          recommendationId:
+            type: string
+            description: |
+              Set when the interaction came from a Personalize response. Closing
+              this loop is what lets the campaign be evaluated at all.
+
+    # -------------------------------------------------------- notification
+    NotificationCommand:
+      name: souq.notify.v1
+      traits: [{ $ref: '#/components/messageTraits/cloudEvent' }]
+      payload:
+        type: object
+        required: [channel, template, dedupeKey]
+        additionalProperties: false
+        properties:
+          channel:  { type: string, enum: [EMAIL, SMS, PUSH, WEBHOOK] }
+          userId:   { type: string }
+          to:       { type: string, description: overrides the user's stored address }
+          template: { type: string, examples: [order_confirmed, payment_failed, shipped] }
+          locale:   { type: string, default: en-GB }
+          params:
+            type: object
+            additionalProperties: true
+          dedupeKey:
+            type: string
+            description: |
+              Second line of defence behind the inbox table. Even if the same
+              logical notification is produced by two different services, the
+              delivery log's primary key stops the customer getting two emails.
+          sendAfter: { type: string, format: date-time }

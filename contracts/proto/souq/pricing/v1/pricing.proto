@@ -1,0 +1,228 @@
+syntax = "proto3";
+
+package souq.pricing.v1;
+
+import "souq/common/v1/money.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package   = "github.com/souq/contracts/gen/go/souq/pricing/v1;pricingv1";
+option java_package = "dev.souq.contracts.pricing.v1";
+option java_multiple_files = true;
+
+// PricingService is the only synchronous dependency on the checkout hot path
+// that is allowed a sub-millisecond budget, which is why it is C++ and gRPC
+// rather than another HTTP/JSON service.
+//
+// Deadline: 250 ms (docs/CONTRACTS.md §5.4). On DEADLINE_EXCEEDED or
+// UNAVAILABLE the caller MUST fall back to list price with no promotions
+// applied, flag the cart `pricing_degraded = true`, and never fail the cart.
+// Selling at list price is a bad day; failing checkout is a worse one.
+service PricingService {
+  // Price a whole cart in one call: line prices, promotions, shipping, tax.
+  // Deterministic — the same request always yields the same response for a
+  // given `rules_version`, which is what makes it safe to cache and to replay
+  // when an order is re-priced at capture time.
+  rpc CalculateCart(CalculateCartRequest) returns (CalculateCartResponse);
+
+  // Batch price lookup for listing pages. No promotions, no tax, no session
+  // context — just the effective unit price. Optimised for 100+ SKUs.
+  rpc GetPrices(GetPricesRequest) returns (GetPricesResponse);
+
+  // Explain why a promotion did or did not apply. Used by the admin dashboard
+  // and by support; never on the hot path.
+  rpc ExplainPromotions(ExplainPromotionsRequest) returns (ExplainPromotionsResponse);
+
+  // Version of the currently loaded rule set. order-service records this on
+  // every order so a price can always be reproduced after the fact.
+  rpc GetRulesVersion(GetRulesVersionRequest) returns (GetRulesVersionResponse);
+}
+
+// ---------------------------------------------------------------------------
+
+message CartLine {
+  string sku = 1;
+  string product_id = 2;
+  int32  quantity = 3;
+
+  // List price as held by catalog-service. Passed in rather than looked up so
+  // that pricing-engine has no synchronous dependency of its own.
+  souq.common.v1.Money unit_list_price = 4;
+
+  repeated string category_path = 5;   // ["electronics", "audio", "headphones"]
+  string brand = 6;
+  map<string, string> attributes = 7;  // colour, size, … for attribute-scoped rules
+}
+
+message PricingContext {
+  string user_id = 1;                  // empty for anonymous
+  string session_id = 2;
+  string currency_code = 3;
+  string country_code = 4;             // ISO-3166-1 alpha-2, drives tax
+  string postal_code = 5;              // sub-national tax where it applies
+  repeated string customer_segments = 6;  // "vip", "b2b", "first_order"
+  repeated string coupon_codes = 7;
+  string channel = 8;                  // "web" | "ios" | "android" | "pos"
+
+  // Pin evaluation to a known rule set. Empty means "latest". order-service
+  // re-prices at capture with the version recorded at order creation, so a
+  // promotion expiring mid-checkout cannot change what the customer agreed to.
+  string rules_version = 9;
+}
+
+message AppliedPromotion {
+  string promotion_id = 1;
+  string name = 2;
+  PromotionType type = 3;
+  souq.common.v1.Money discount = 4;   // always negative
+  string coupon_code = 5;
+  repeated string applies_to_skus = 6;
+  int32 priority = 7;
+  bool exclusive = 8;                  // suppressed every lower-priority rule
+}
+
+enum PromotionType {
+  PROMOTION_TYPE_UNSPECIFIED = 0;
+  PROMOTION_TYPE_PERCENT_OFF = 1;
+  PROMOTION_TYPE_AMOUNT_OFF = 2;
+  PROMOTION_TYPE_BUY_X_GET_Y = 3;
+  PROMOTION_TYPE_TIERED_QUANTITY = 4;
+  PROMOTION_TYPE_BUNDLE = 5;
+  PROMOTION_TYPE_FREE_SHIPPING = 6;
+  PROMOTION_TYPE_CART_THRESHOLD = 7;
+}
+
+message RejectedPromotion {
+  string promotion_id = 1;
+  string coupon_code = 2;
+  // Machine code the storefront turns into a localised message:
+  // COUPON_EXPIRED, COUPON_NOT_FOUND, MIN_SPEND_NOT_MET, SEGMENT_MISMATCH,
+  // USAGE_LIMIT_REACHED, EXCLUDED_BY_EXCLUSIVE_PROMOTION, CHANNEL_MISMATCH
+  string reason_code = 3;
+  string detail = 4;
+}
+
+message TaxLine {
+  string name = 1;                     // "VAT", "Sales Tax"
+  string jurisdiction = 2;
+  souq.common.v1.BasisPoints rate = 3;
+  souq.common.v1.Money amount = 4;
+  bool inclusive = 5;                  // true in the EU, false in the US
+}
+
+message LinePrice {
+  string sku = 1;
+  int32 quantity = 2;
+  souq.common.v1.Money unit_list_price = 3;
+  souq.common.v1.Money unit_effective_price = 4;
+  souq.common.v1.Money line_subtotal = 5;   // unit_effective * quantity
+  souq.common.v1.Money line_discount = 6;   // negative
+  souq.common.v1.Money line_total = 7;      // subtotal + discount
+  repeated string applied_promotion_ids = 8;
+}
+
+message CalculateCartRequest {
+  repeated CartLine lines = 1;
+  PricingContext context = 2;
+
+  // Shipping quote from the carrier integration, passed in so free-shipping
+  // rules can zero it without pricing-engine calling out.
+  souq.common.v1.Money shipping_quote = 3;
+}
+
+message CalculateCartResponse {
+  repeated LinePrice lines = 1;
+
+  souq.common.v1.Money subtotal = 2;        // sum of line_subtotal
+  souq.common.v1.Money discount_total = 3;  // negative
+  souq.common.v1.Money shipping_total = 4;
+  souq.common.v1.Money tax_total = 5;
+  souq.common.v1.Money grand_total = 6;     // what we will actually charge
+
+  repeated AppliedPromotion applied_promotions = 7;
+  repeated RejectedPromotion rejected_promotions = 8;
+  repeated TaxLine tax_lines = 9;
+
+  string rules_version = 10;
+  google.protobuf.Timestamp calculated_at = 11;
+
+  // Set when the engine had to degrade (rule set failed to load, tax provider
+  // unreachable). The cart is still valid and chargeable at these numbers;
+  // the storefront hides promo messaging when true.
+  bool degraded = 12;
+  repeated string degraded_reasons = 13;
+}
+
+// ---------------------------------------------------------------------------
+
+// The list price is passed in, exactly as CartLine does it.
+//
+// The first version of this took bare SKUs, which made the RPC impossible:
+// pricing-engine holds no catalogue, and giving it one would put a synchronous
+// dependency inside the only service on the checkout hot path with a
+// sub-millisecond budget. So the caller — which already has these prices,
+// because it just rendered them — supplies them.
+message SkuListPrice {
+  string sku = 1;
+  souq.common.v1.Money list_price = 2;
+  // Optional. Some rules are per-product rather than per-SKU (a brand-level
+  // promotion, a category exclusion), and without this they cannot match.
+  string product_id = 3;
+}
+
+message GetPricesRequest {
+  repeated SkuListPrice items = 1;
+  string currency_code = 2;
+  string country_code = 3;
+  repeated string customer_segments = 4;
+}
+
+message SkuPrice {
+  string sku = 1;
+  souq.common.v1.Money list_price = 2;
+  souq.common.v1.Money effective_price = 3;
+  bool on_promotion = 4;
+  souq.common.v1.BasisPoints discount_rate = 5;
+}
+
+message GetPricesResponse {
+  repeated SkuPrice prices = 1;
+  repeated string unknown_skus = 2;
+  string rules_version = 3;
+}
+
+// ---------------------------------------------------------------------------
+
+message ExplainPromotionsRequest {
+  repeated CartLine lines = 1;
+  PricingContext context = 2;
+  // Empty means "every rule in the set".
+  repeated string promotion_ids = 3;
+}
+
+message PromotionTrace {
+  string promotion_id = 1;
+  bool matched = 2;
+  // One entry per predicate, in evaluation order.
+  repeated ConditionTrace conditions = 3;
+  souq.common.v1.Money would_discount = 4;
+  int64 evaluation_micros = 5;
+}
+
+message ConditionTrace {
+  string expression = 1;    // "cart.subtotal >= 5000"
+  bool satisfied = 2;
+  string actual_value = 3;  // "3200"
+}
+
+message ExplainPromotionsResponse {
+  repeated PromotionTrace traces = 1;
+  string rules_version = 2;
+}
+
+message GetRulesVersionRequest {}
+
+message GetRulesVersionResponse {
+  string rules_version = 1;
+  google.protobuf.Timestamp loaded_at = 2;
+  int32 active_rule_count = 3;
+}

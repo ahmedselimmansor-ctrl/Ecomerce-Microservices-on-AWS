@@ -1,0 +1,132 @@
+{
+  "_comment": [
+    "Promotion rule set. Loaded at startup and on SIGHUP; never edited in place",
+    "on a running pod. `version` is recorded on every order so the totals can be",
+    "reproduced exactly at capture time even after a rule expires — see",
+    "docs/CONTRACTS.md §4.",
+    "",
+    "Priority runs low to high. `exclusive` suppresses everything after it.",
+    "`maxDiscount` is not optional on a percentage rule: an uncapped percentage",
+    "on a high-value cart is how a pricing bug becomes a five-figure loss."
+  ],
+  "version": "rules-2026-08-01",
+  "currency": "EGP",
+
+  "taxes": [
+    {
+      "countryCode": "EG",
+      "name": "VAT",
+      "jurisdiction": "Egypt",
+      "rateBasisPoints": 1400,
+      "_comment": "Inclusive: Egyptian shelf prices already contain VAT. Setting this false would add 14% to every displayed price.",
+      "inclusive": true
+    },
+    {
+      "countryCode": "AE",
+      "name": "VAT",
+      "jurisdiction": "United Arab Emirates",
+      "rateBasisPoints": 500,
+      "inclusive": true
+    },
+    {
+      "countryCode": "SA",
+      "name": "VAT",
+      "jurisdiction": "Saudi Arabia",
+      "rateBasisPoints": 1500,
+      "inclusive": true
+    }
+  ],
+
+  "rules": [
+    {
+      "id": "promo_welcome10",
+      "name": "10% off your first order",
+      "type": "PERCENT_OFF",
+      "percentOffBasisPoints": 1000,
+      "maxDiscount": 20000,
+      "priority": 10,
+      "exclusive": false,
+      "active": true,
+      "conditions": [
+        { "field": "SEGMENT", "op": "IN", "values": ["first_order"] },
+        { "field": "CART_SUBTOTAL", "op": "GTE", "numeric": 50000 }
+      ]
+    },
+    {
+      "id": "promo_vip15",
+      "name": "VIP 15%",
+      "type": "PERCENT_OFF",
+      "percentOffBasisPoints": 1500,
+      "maxDiscount": 100000,
+      "priority": 20,
+      "_comment": "Exclusive. Without it a VIP with a coupon stacks to 40% off and nobody notices until the month-end margin report.",
+      "exclusive": true,
+      "active": true,
+      "conditions": [
+        { "field": "SEGMENT", "op": "IN", "values": ["vip"] }
+      ]
+    },
+    {
+      "id": "promo_audio_bundle",
+      "name": "Buy 2 audio accessories, get 1 free",
+      "type": "BUY_X_GET_Y",
+      "buyQuantity": 2,
+      "getQuantity": 1,
+      "getDiscountBasisPoints": 10000,
+      "priority": 30,
+      "active": true,
+      "conditions": [
+        { "field": "CATEGORY_PATH", "op": "IN", "values": ["audio"] }
+      ]
+    },
+    {
+      "id": "promo_bulk_tiers",
+      "name": "Bulk discount",
+      "type": "TIERED_QUANTITY",
+      "_comment": "Highest qualifying tier wins; tiers are NOT additive.",
+      "tiers": [
+        { "minQuantity": 3,  "discountBasisPoints": 500 },
+        { "minQuantity": 5,  "discountBasisPoints": 1000 },
+        { "minQuantity": 10, "discountBasisPoints": 2000 }
+      ],
+      "priority": 40,
+      "active": true,
+      "conditions": []
+    },
+    {
+      "id": "promo_free_shipping",
+      "name": "Free shipping over 1000 EGP",
+      "type": "FREE_SHIPPING",
+      "priority": 50,
+      "active": true,
+      "conditions": [
+        { "field": "CART_SUBTOTAL", "op": "GTE", "numeric": 100000 }
+      ]
+    },
+    {
+      "id": "promo_save50",
+      "name": "SAVE50 — 50 EGP off",
+      "type": "AMOUNT_OFF",
+      "amountOff": 5000,
+      "couponCode": "SAVE50",
+      "priority": 60,
+      "active": true,
+      "validUntil": 1798761600,
+      "conditions": [
+        { "field": "CART_SUBTOTAL", "op": "GTE", "numeric": 30000 }
+      ]
+    },
+    {
+      "id": "promo_expired_demo",
+      "name": "Expired coupon, kept so the rejection path is exercised locally",
+      "type": "PERCENT_OFF",
+      "percentOffBasisPoints": 2500,
+      "maxDiscount": 50000,
+      "couponCode": "EXPIRED25",
+      "priority": 70,
+      "active": true,
+      "validUntil": 1700000000,
+      "conditions": []
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+spring:
+  application.name: identity-service
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    hikari:
+      # Sized against the Aurora connection budget, not against traffic. Eleven
+      # services sharing a cluster each grabbing 50 connections exhausts it.
+      maximum-pool-size: 20
+      minimum-idle: 2
+      connection-timeout: 3000
+      max-lifetime: 1800000
+      # Jitter so the whole pool does not recycle in lockstep and produce a
+      # reconnect storm every 30 minutes.
+      keepalive-time: 300000
+
+  jpa:
+    open-in-view: false   # never hold a transaction across view rendering
+    hibernate.ddl-auto: validate   # Flyway owns the schema; Hibernate must not touch it
+    properties.hibernate.jdbc.time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # Fail rather than silently accepting a schema someone changed by hand.
+    validate-on-migrate: true
+
+  kafka:
+    bootstrap-servers: ${SOUQ_KAFKA_BROKERS}
+    producer:
+      # acks=all: a produce is not acknowledged until every in-sync replica
+      # has it. Anything weaker can lose an event the outbox relay has already
+      # marked published.
+      acks: all
+      properties.enable.idempotence: true
+      retries: 3
+      compression-type: snappy
+
+server:
+  port: ${SOUQ_HTTP_PORT:8081}
+  shutdown: graceful
+  # A slow client must not be able to hold a worker thread indefinitely.
+  tomcat.connection-timeout: 5s
+  error.whitelabel.enabled: false
+
+management:
+  endpoints.web.exposure.include: health,prometheus
+  endpoint.health:
+    # Split probes: liveness must never touch a dependency, or a database blip
+    # restarts every pod at once and turns a brownout into an outage.
+    probes.enabled: true
+    group:
+      liveness.include: livenessState
+      readiness.include: readinessState,db
+    show-details: never
+  metrics.tags.service: identity-service
+
+  # Drain before the process stops accepting. Skipping this drops in-flight
+  # logins on every deploy.
+  server.port: ${SOUQ_HTTP_PORT:8081}
+
+souq:
+  jwt:
+    issuer: ${SOUQ_JWT_ISSUER:https://auth.souq.dev}
+    audience: ${SOUQ_JWT_AUDIENCE:souq-api}
+    # KMS in production; a generated in-memory key locally. The provider
+    # refuses to generate one outside local/test.
+    signing-key-source: ${SOUQ_JWT_KEY_SOURCE:local}
+    kms-key-id: ${SOUQ_JWT_KMS_KEY_ID:}
+  security:
+    # Per-account and per-IP. Credential stuffing spreads across accounts from
+    # few IPs; a targeted attack does the opposite, so both are needed.
+    max-failed-logins-per-account: 5
+    max-failed-logins-per-ip: 20
+    lockout-window-minutes: 15
+
+logging.level:
+  root: INFO
+  dev.souq: ${SOUQ_LOG_LEVEL:INFO}
+  org.hibernate.SQL: WARN

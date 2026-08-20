@@ -1,0 +1,42 @@
+# Local Prometheus. In AWS this is Amazon Managed Prometheus and the scrape is
+# done by the ADOT collector — see infra/terraform/modules/observability.
+global:
+  scrape_interval: 10s
+  evaluation_interval: 15s
+  external_labels: { env: local, cluster: souq-local }
+
+rule_files: [/etc/prometheus/rules.yml]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs: [{ targets: ['localhost:9090'] }]
+
+  # One job per service rather than one with many targets, so a service that
+  # is down shows as a distinct job=... failure rather than one flapping
+  # target inside a healthy-looking job.
+  - job_name: order-service
+    static_configs: [{ targets: ['order-service:8084'], labels: { service: order-service } }]
+  - job_name: inventory-service
+    static_configs: [{ targets: ['inventory-service:8085'], labels: { service: inventory-service } }]
+  - job_name: payment-service
+    static_configs: [{ targets: ['payment-service:8086'], labels: { service: payment-service } }]
+  - job_name: cart-service
+    static_configs: [{ targets: ['cart-service:8083'], labels: { service: cart-service } }]
+  - job_name: search-service
+    static_configs: [{ targets: ['search-service:8087'], labels: { service: search-service } }]
+  - job_name: recommendation-service
+    static_configs: [{ targets: ['recommendation-service:8088'], labels: { service: recommendation-service } }]
+  - job_name: pricing-engine
+    static_configs: [{ targets: ['pricing-engine:8089'], labels: { service: pricing-engine } }]
+  - job_name: review-service
+    static_configs: [{ targets: ['review-service:8090'], labels: { service: review-service } }]
+  - job_name: notification-service
+    static_configs: [{ targets: ['notification-service:8091'], labels: { service: notification-service } }]
+
+  # Spring Boot exposes Prometheus under /actuator, not /metrics.
+  - job_name: identity-service
+    metrics_path: /actuator/prometheus
+    static_configs: [{ targets: ['identity-service:8081'], labels: { service: identity-service } }]
+  - job_name: catalog-service
+    metrics_path: /actuator/prometheus
+    static_configs: [{ targets: ['catalog-service:8082'], labels: { service: catalog-service } }]

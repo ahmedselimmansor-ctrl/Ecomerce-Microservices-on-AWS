@@ -1,0 +1,228 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: souq
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/component: payment
+    app.kubernetes.io/part-of: souq
+  annotations:
+    # Port 443 egress is Paymob. This is the ONLY service permitted to reach the
+    # public internet, and only to the payment provider.
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never dip below the declared count during a deploy. Surging is cheaper
+      # than losing capacity mid-rollout.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment-service
+        app.kubernetes.io/component: payment
+        app.kubernetes.io/part-of: souq
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8086"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: payment-service      # IRSA — no static AWS credentials
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      # Spread across AZs so losing one does not lose the service.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-service
+      containers:
+        - name: payment-service
+          image: ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/souq/payment-service:GIT_SHA
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8086, protocol: TCP }
+          env:
+            - name: SOUQ_ENV
+              value: production
+            - name: SOUQ_HTTP_ADDR
+              value: ":8086"
+            - name: SOUQ_KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: kafka.brokers }
+            - name: SOUQ_JWKS_URL
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: jwks.url }
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef: { name: souq-platform, key: otel.endpoint }
+            - name: OTEL_SERVICE_NAME
+              value: payment-service
+            - name: SOUQ_DB_URL
+              valueFrom:
+                secretKeyRef: { name: payment-service-secrets, key: db-url }
+            - name: SOUQ_PSP_KEY_SALT
+              valueFrom:
+                secretKeyRef: { name: payment-service-secrets, key: psp-key-salt }
+            - name: SOUQ_PAYMOB_API_KEY
+              valueFrom:
+                secretKeyRef: { name: payment-service-secrets, key: paymob-api-key }
+            - name: SOUQ_PAYMOB_HMAC_SECRET
+              valueFrom:
+                secretKeyRef: { name: payment-service-secrets, key: paymob-hmac-secret }
+            - name: GOMAXPROCS
+              # Size the Go runtime to the cgroup, not the node. Otherwise
+              # GOMAXPROCS is 64 on a 64-core node for a 1-core pod.
+              valueFrom:
+                resourceFieldRef: { resource: limits.cpu }
+            - name: GOMEMLIMIT
+              value: "900MiB"
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            # No CPU limit: throttling a latency-sensitive service at the p99
+            # does more harm than the noisy-neighbour risk it prevents. Memory
+            # IS limited, because a leak must be contained.
+            limits: { memory: 1Gi }
+          startupProbe:
+            # Covers slow first-boot work without making liveness lenient forever.
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            # Never touches a dependency. A probe a database blip can fail
+            # restarts every pod at once and turns a brownout into an outage.
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              # Let the ALB deregister this target before the process stops
+              # accepting. Without it every deploy drops in-flight requests.
+              exec: { command: ["/bin/sleep", "5"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: souq
+  labels:
+    app.kubernetes.io/name: payment-service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: payment-service
+  ports:
+    - { name: http, port: 8086, targetPort: http, protocol: TCP }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service
+  namespace: souq
+spec:
+  # minAvailable, not maxUnavailable: it keeps its meaning when the HPA scales
+  # the deployment underneath it.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payment-service
+  namespace: souq
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-service
+  minReplicas: 3
+  maxReplicas: 24
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 65 }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+    scaleDown:
+      # Slow. Scaling in during a lull right before the next burst is how you
+      # get a cold-start stampede.
+      stabilizationWindowSeconds: 300
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 60 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-service
+  namespace: souq
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: api-gateway }
+        - podSelector:
+            matchLabels: { app.kubernetes.io/part-of: souq }
+      ports:
+        - { protocol: TCP, port: 8086 }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: observability }
+      ports:
+        - { protocol: TCP, port: 8086 }
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Explicitly enumerated, so a compromised pod cannot exfiltrate to an
+    # arbitrary endpoint.
+    - to:
+        - ipBlock: { cidr: 10.0.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 4317 }
+        - { protocol: TCP, port: 5432 }
+        - { protocol: TCP, port: 9098 }
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/part-of: souq }
