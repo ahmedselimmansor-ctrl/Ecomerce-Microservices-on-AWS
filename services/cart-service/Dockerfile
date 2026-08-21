@@ -17,13 +17,18 @@
 FROM node:22-alpine AS deps
 WORKDIR /repo
 COPY libs/ts-contracts ./libs/ts-contracts
+# BUILD it. `main` points at dist/, which is gitignored — so a clean checkout
+# has no dist/ and every consumer fails with "Cannot find module
+# '@souq/contracts'". A local build can pass on a stale dist/ left over from
+# earlier work, which is exactly how this reached CI.
+RUN cd libs/ts-contracts && npm install --no-audit --no-fund && npm run build
 COPY services/cart-service/package*.json ./services/cart-service/
 WORKDIR /repo/services/cart-service
 RUN npm install --omit=dev --no-audit --no-fund
 
 FROM node:22-alpine AS build
 WORKDIR /repo
-COPY libs/ts-contracts ./libs/ts-contracts
+COPY --from=deps /repo/libs/ts-contracts ./libs/ts-contracts
 COPY services/cart-service/package*.json ./services/cart-service/
 WORKDIR /repo/services/cart-service
 RUN npm install --no-audit --no-fund
@@ -33,6 +38,7 @@ RUN npm run build
 FROM node:22-alpine AS dev
 WORKDIR /repo
 COPY libs/ts-contracts ./libs/ts-contracts
+RUN cd libs/ts-contracts && npm install --no-audit --no-fund && npm run build
 COPY services/cart-service/package*.json ./services/cart-service/
 WORKDIR /repo/services/cart-service
 RUN npm install --no-audit --no-fund
