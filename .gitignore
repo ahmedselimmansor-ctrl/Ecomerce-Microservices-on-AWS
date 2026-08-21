@@ -42,6 +42,7 @@ venv/
 *.tfstate
 *.tfstate.*
 .terraform/
+.terraform-plugin-cache/
 .terraform.lock.hcl
 *.tfvars
 !*.tfvars.example

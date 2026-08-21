@@ -15,5 +15,11 @@ dev = ["pytest>=8.3"]
 [tool.setuptools.packages.find]
 include = ["souq_contracts*"]
 
+# PEP 561. Without this marker file, mypy refuses to read the package's
+# annotations and reports "Cannot find implementation or library stub" in every
+# consumer — even though the package is installed and fully typed.
+[tool.setuptools.package-data]
+souq_contracts = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

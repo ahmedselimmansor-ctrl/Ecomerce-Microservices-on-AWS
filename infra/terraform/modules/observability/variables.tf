@@ -1,9 +1,18 @@
-variable "name"              { type = string }
-variable "region"            { type = string }
-variable "account_id"        { type = string }
-variable "cluster_name"      { type = string }
-variable "oidc_provider_arn" { type = string }
-
+variable "name" {
+  type = string
+}
+variable "region" {
+  type = string
+}
+variable "account_id" {
+  type = string
+}
+variable "cluster_name" {
+  type = string
+}
+variable "oidc_provider_arn" {
+  type = string
+}
 variable "enable_managed_prometheus" {
   description = "Managed, not self-hosted: the metrics stack must survive the cluster it observes."
   type        = bool

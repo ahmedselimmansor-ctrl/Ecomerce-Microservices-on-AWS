@@ -1,13 +1,17 @@
-variable "name"        { type = string }
-variable "domain_name" { type = string }
-
+variable "name" {
+  type = string
+}
+variable "domain_name" {
+  type = string
+}
 variable "alb_dns_name" {
   description = "The internal ALB. Reachable only via CloudFront, enforced by the X-Origin-Verify header."
   type        = string
 }
 
-variable "kms_key_arn" { type = string }
-
+variable "kms_key_arn" {
+  type = string
+}
 variable "rate_limit_general" {
   description = "Requests per IP per 5-minute window across the whole site."
   type        = number

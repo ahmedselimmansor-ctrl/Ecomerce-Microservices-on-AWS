@@ -18,7 +18,6 @@ output "cluster_name" {
 output "cluster_endpoint" {
   value = module.eks.cluster_endpoint
 }
-
 output "jwt_signing_key_arn" {
   description = <<-EOT
     Substituted into the souq-platform ConfigMap as jwt.kms.key.id.
@@ -40,7 +39,6 @@ output "jwt_signing_key_alias" {
 output "data_kms_key_arn" {
   value = aws_kms_key.data.arn
 }
-
 output "irsa_role_arns" {
   description = "Per-service IAM roles, annotated onto each ServiceAccount."
   value       = module.eks.irsa_role_arns

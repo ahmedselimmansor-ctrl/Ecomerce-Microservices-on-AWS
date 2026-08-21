@@ -126,7 +126,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          # Must be >= the `go` directive in go.mod, which is 1.25.0. Pinning
+          # 1.23 made Go download a 1.25 toolchain on demand, and that
+          # partial toolchain has no `covdata` — so `go test -coverprofile`
+          # failed with `go: no such tool "covdata"`, which names neither the
+          # version nor the cause.
+          go-version: '1.25'
           cache-dependency-path: services/${{ matrix.service }}/go.sum
 
       - name: Verify go.mod is tidy
@@ -329,17 +334,11 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with: { terraform_version: '1.9.8' }
 
-      - name: Format
-        run: terraform fmt -check -recursive infra/terraform
-
-      - name: Validate every module
-        run: |
-          for dir in infra/terraform/modules/*/ infra/terraform/envs/*/; do
-            echo "::group::$dir"
-            terraform -chdir="$dir" init -backend=false -input=false
-            terraform -chdir="$dir" validate
-            echo "::endgroup::"
-          done
+      # One script, shared with `make tf-check`, so a module cannot pass
+      # locally and fail here. It also knows which modules CANNOT be validated
+      # standalone — see the comment at the top of it.
+      - name: Format and validate
+        run: bash scripts/tf-check.sh
 
       - uses: aquasecurity/tfsec-action@v1.0.3
         with: { working_directory: infra/terraform, soft_fail: false }
@@ -371,7 +370,17 @@ jobs:
         run: |
           curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
             | tar xz -C /tmp
-          /tmp/kubeconform -strict -summary -kubernetes-version 1.31.0 /tmp/*.yaml
+          # ExternalSecret and SecretStore are CRDs. kubeconform ships schemas
+          # for core Kubernetes only, so without a CRD schema source it reports
+          # them as errors — which is not the same as them being wrong.
+          #
+          # The datreeio catalogue carries generated schemas for common CRDs.
+          # -ignore-missing-schemas would also silence it, but it silences
+          # every future typo in every CRD too.
+          /tmp/kubeconform -strict -summary -kubernetes-version 1.31.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /tmp/*.yaml
 
       # Policy, not schema: no :latest tags, no privileged containers, no
       # missing resource limits, no root.
@@ -442,7 +451,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Dependency and IaC scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type: fs
           scan-ref: .
@@ -530,7 +539,7 @@ jobs:
           sbom: true
 
       - name: Scan the built image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: ${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.sha }}
           format: table

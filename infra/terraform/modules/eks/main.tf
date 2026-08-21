@@ -73,7 +73,9 @@ resource "aws_eks_cluster" "this" {
   # base64-encoded — that is encoding, not encryption, and an etcd snapshot
   # hands over every credential in the cluster.
   encryption_config {
-    provider { key_arn = var.secrets_kms_key_arn }
+    provider {
+      key_arn = var.secrets_kms_key_arn
+    }
     resources = ["secrets"]
   }
 
@@ -112,7 +114,9 @@ resource "aws_security_group" "cluster" {
   }
 
   tags = merge(local.tags, { Name = "${var.name}-cluster" })
-  lifecycle { create_before_destroy = true }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 ##############################################################################
@@ -122,7 +126,6 @@ resource "aws_security_group" "cluster" {
 data "tls_certificate" "oidc" {
   url = aws_eks_cluster.this.identity[0].oidc[0].issuer
 }
-
 resource "aws_iam_openid_connect_provider" "this" {
   url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
   client_id_list  = ["sts.amazonaws.com"]
@@ -191,7 +194,7 @@ resource "aws_eks_node_group" "system" {
   # built multi-arch, so there is no reason to pay for x86 here.
   instance_types = var.system_node_instance_types
   ami_type       = "AL2023_ARM_64_STANDARD"
-  capacity_type  = "ON_DEMAND"   # never spot: these nodes run CoreDNS
+  capacity_type  = "ON_DEMAND" # never spot: these nodes run CoreDNS
 
   scaling_config {
     desired_size = var.system_node_min_size
@@ -583,7 +586,11 @@ resource "aws_eks_access_policy_association" "admins" {
   principal_arn = each.value
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
 
-  access_scope { type = "cluster" }
+  access_scope {
+
+    type = "cluster"
+
+  }
   depends_on = [aws_eks_access_entry.admins]
 }
 
@@ -604,6 +611,10 @@ resource "aws_eks_access_policy_association" "viewers" {
   principal_arn = each.value
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
 
-  access_scope { type = "cluster" }
+  access_scope {
+
+    type = "cluster"
+
+  }
   depends_on = [aws_eks_access_entry.viewers]
 }

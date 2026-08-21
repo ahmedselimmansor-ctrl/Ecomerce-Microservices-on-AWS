@@ -18,7 +18,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 __all__ = [
     "Strict",
@@ -54,7 +54,22 @@ class Strict(BaseModel):
     )
 
 
-CurrencyCode = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
+# Three letters, and the case is normalised *before* the pattern is applied.
+#
+# `Field(pattern=...)` runs as part of the type's own validation, which happens
+# BEFORE any `mode="after"` field_validator — so an uppercase-only pattern
+# rejects "egp" before the validator that would have uppercased it ever runs.
+# Doing the normalisation in a `mode="before"` validator on the annotated type
+# puts it in the right order.
+def _normalise_currency(value: object) -> object:
+    return value.upper() if isinstance(value, str) else value
+
+
+CurrencyCode = Annotated[
+    str,
+    BeforeValidator(_normalise_currency),
+    Field(pattern=r"^[A-Z]{3}$"),
+]
 
 
 class Money(Strict):
@@ -73,11 +88,6 @@ class Money(Strict):
 
     amount: int
     currency: CurrencyCode
-
-    @field_validator("currency")
-    @classmethod
-    def _upper(cls, value: str) -> str:
-        return value.upper()
 
     def formatted(self) -> str:
         """A plain rendering for logs. Not for a user interface — that is the frontend's job."""

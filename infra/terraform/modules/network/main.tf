@@ -39,7 +39,6 @@ locals {
 data "aws_availability_zones" "available" {
   state = "available"
 }
-
 resource "aws_vpc" "this" {
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
@@ -83,9 +82,9 @@ resource "aws_subnet" "private" {
   availability_zone = local.azs[count.index]
 
   tags = merge(local.tags, {
-    Name                              = "${var.name}-private-${local.azs[count.index]}"
-    Tier                              = "private"
-    "kubernetes.io/role/internal-elb" = "1"
+    Name                                = "${var.name}-private-${local.azs[count.index]}"
+    Tier                                = "private"
+    "kubernetes.io/role/internal-elb"   = "1"
     "kubernetes.io/cluster/${var.name}" = "shared"
     # Karpenter finds capacity to provision into by this tag.
     "karpenter.sh/discovery" = var.name
@@ -253,11 +252,11 @@ resource "aws_security_group" "vpc_endpoints" {
 
 resource "aws_vpc_endpoint" "interface" {
   for_each = var.enable_interface_endpoints ? toset([
-    "ecr.api", "ecr.dkr",       # image pulls without egressing to the internet
-    "secretsmanager",           # database credentials
-    "kms",                      # JWT signing keys, envelope encryption
-    "logs", "monitoring",       # CloudWatch Logs and metrics
-    "sts",                      # IRSA token exchange
+    "ecr.api", "ecr.dkr",                # image pulls without egressing to the internet
+    "secretsmanager",                    # database credentials
+    "kms",                               # JWT signing keys, envelope encryption
+    "logs", "monitoring",                # CloudWatch Logs and metrics
+    "sts",                               # IRSA token exchange
     "ssm", "ssmmessages", "ec2messages", # SSM Session Manager, so no bastion
     "sqs", "sns",
     "elasticloadbalancing",
@@ -330,11 +329,11 @@ resource "aws_iam_role_policy" "flow" {
 }
 
 resource "aws_flow_log" "this" {
-  vpc_id               = aws_vpc.this.id
-  traffic_type         = "REJECT"
-  log_destination_type = "cloud-watch-logs"
-  log_destination      = aws_cloudwatch_log_group.flow.arn
-  iam_role_arn         = aws_iam_role.flow.arn
+  vpc_id                   = aws_vpc.this.id
+  traffic_type             = "REJECT"
+  log_destination_type     = "cloud-watch-logs"
+  log_destination          = aws_cloudwatch_log_group.flow.arn
+  iam_role_arn             = aws_iam_role.flow.arn
   max_aggregation_interval = 60
 
   tags = merge(local.tags, { Name = "${var.name}-flowlogs" })

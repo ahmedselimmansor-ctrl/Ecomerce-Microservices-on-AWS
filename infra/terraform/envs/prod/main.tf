@@ -67,7 +67,11 @@ provider "aws" {
   alias  = "us_east_1"
   region = "us-east-1"
 
-  default_tags { tags = local.tags }
+  default_tags {
+
+    tags = local.tags
+
+  }
   allowed_account_ids = [var.account_id]
 }
 
@@ -277,9 +281,9 @@ module "eks" {
 
   # Private API endpoint. Access is via SSM Session Manager or the VPN — there
   # is no public control-plane endpoint to find and probe.
-  endpoint_public_access       = false
-  endpoint_private_access      = true
-  public_access_cidrs          = []
+  endpoint_public_access  = false
+  endpoint_private_access = true
+  public_access_cidrs     = []
 
   # A small always-on managed node group runs the things that must exist
   # before Karpenter can schedule anything — CoreDNS, the EBS CSI driver, and
@@ -290,8 +294,8 @@ module "eks" {
 
   enable_karpenter = true
 
-  cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
-  log_kms_key_arn   = aws_kms_key.logs.arn
+  cluster_log_types   = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+  log_kms_key_arn     = aws_kms_key.logs.arn
   secrets_kms_key_arn = aws_kms_key.data.arn
 
   tags = local.tags
@@ -317,8 +321,8 @@ module "data" {
 
   is_production = true
 
-  msk_broker_count  = 3
-  msk_instance_type = "kafka.m5.large"
+  msk_broker_count   = 3
+  msk_instance_type  = "kafka.m5.large"
   msk_volume_size_gb = 200
 
   redis_node_type          = "cache.r7g.large"

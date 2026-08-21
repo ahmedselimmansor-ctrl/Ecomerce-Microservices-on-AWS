@@ -13,7 +13,6 @@ variable "name" {
 variable "region" {
   type = string
 }
-
 variable "account_id" {
   description = "Used in the flow-log role's confused-deputy conditions."
   type        = string
@@ -54,8 +53,8 @@ variable "one_nat_per_az" {
     failure domain. At production traffic the data-transfer saving usually
     exceeds the extra gateway cost.
   EOT
-  type    = bool
-  default = false
+  type        = bool
+  default     = false
 }
 
 variable "enable_interface_endpoints" {

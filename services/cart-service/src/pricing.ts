@@ -1,6 +1,8 @@
 import { credentials, Client, Metadata, type ServiceError } from '@grpc/grpc-js';
 import { loadSync } from '@grpc/proto-loader';
 import type { Money } from '@souq/contracts';
+import { CircuitBreaker, type BreakerState } from './circuit-breaker.js';
+
 import { logger, pricingCalls, pricingLatency } from './telemetry.js';
 
 /**
@@ -44,19 +46,21 @@ export interface CalculateRequest {
   };
 }
 
-type BreakerState = 'closed' | 'open' | 'half-open';
 
 export class PricingClient {
   private client: Client;
-  private state: BreakerState = 'closed';
-  private failures: boolean[] = [];   // rolling window
-  private openedAt = 0;
 
-  // Tuning from docs/CONTRACTS.md §5.4: open at 50% failures over a
-  // 20-request window, probe after 10 seconds.
-  private readonly windowSize = 20;
-  private readonly failureThreshold = 0.5;
-  private readonly probeAfterMs = 10_000;
+  // The policy lives in CircuitBreaker so it can be tested without a gRPC
+  // channel. Tuning is docs/CONTRACTS.md §5.4.
+  private readonly breaker = new CircuitBreaker({
+    windowSize: 20,
+    failureThreshold: 0.5,
+    probeAfterMs: 10_000,
+    onHalfOpen: () => logger.info('pricing-engine circuit is half-open; sending a probe'),
+    onClose: () => logger.info('pricing-engine recovered; circuit closed'),
+    onOpen: (failureRate) =>
+      logger.error({ failureRate }, 'pricing-engine circuit opened; carts will show list prices'),
+  });
 
   constructor(target: string, protoPath: string) {
     const pkg = loadSync(protoPath, {
@@ -112,52 +116,17 @@ export class PricingClient {
     });
   }
 
-  /** Whether a call may proceed under the current breaker state. */
   private allow(): boolean {
-    if (this.state === 'closed') return true;
-
-    if (this.state === 'open') {
-      if (Date.now() - this.openedAt < this.probeAfterMs) return false;
-      // One probe. If it succeeds the breaker closes; if it fails we go
-      // straight back to open without a thundering herd of retries.
-      this.state = 'half-open';
-      logger.info('pricing-engine circuit is half-open; sending a probe');
-      return true;
-    }
-
-    // half-open: only the single probe is in flight.
-    return false;
+    return this.breaker.allow();
   }
 
   private record(success: boolean): void {
-    if (this.state === 'half-open') {
-      this.state = success ? 'closed' : 'open';
-      if (success) {
-        this.failures = [];
-        logger.info('pricing-engine recovered; circuit closed');
-      } else {
-        this.openedAt = Date.now();
-        logger.warn('pricing-engine probe failed; circuit re-opened');
-      }
-      return;
-    }
-
-    this.failures.push(!success);
-    if (this.failures.length > this.windowSize) this.failures.shift();
-
-    // Only judge on a full window. Opening after the first two failures of a
-    // cold start would take pricing out on every deploy.
-    if (this.failures.length < this.windowSize) return;
-
-    const rate = this.failures.filter(Boolean).length / this.failures.length;
-    if (rate >= this.failureThreshold && this.state === 'closed') {
-      this.state = 'open';
-      this.openedAt = Date.now();
-      logger.error({ failureRate: rate }, 'pricing-engine circuit opened; carts will show list prices');
-    }
+    this.breaker.record(success);
   }
 
-  get breakerState(): BreakerState { return this.state; }
+  get breakerState(): BreakerState {
+    return this.breaker.currentState;
+  }
 
   close(): void { this.client.close(); }
 }

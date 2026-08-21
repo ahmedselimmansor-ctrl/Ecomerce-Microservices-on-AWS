@@ -18,7 +18,7 @@ terraform {
 }
 
 locals {
-  tags = merge(var.tags, { Module = "edge" })
+  tags       = merge(var.tags, { Module = "edge" })
   s3_origin  = "s3-media"
   alb_origin = "alb-app"
 }
@@ -89,7 +89,9 @@ resource "aws_s3_bucket_versioning" "invoices" {
   bucket = aws_s3_bucket.invoices.id
   # Invoices are financial records. Versioning turns an accidental overwrite
   # from a data-loss incident into a restore.
-  versioning_configuration { status = "Enabled" }
+  versioning_configuration {
+    status = "Enabled"
+  }
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "media" {
@@ -101,13 +103,17 @@ resource "aws_s3_bucket_lifecycle_configuration" "media" {
     filter {}
     # Failed multipart uploads are invisible in the console and billed
     # forever. Everyone discovers this via a cost review.
-    abort_incomplete_multipart_upload { days_after_initiation = 7 }
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
   }
 
   rule {
     id     = "archive-old-media"
     status = "Enabled"
-    filter { prefix = "archive/" }
+    filter {
+      prefix = "archive/"
+    }
     transition {
       days          = 90
       storage_class = "INTELLIGENT_TIERING"
@@ -121,8 +127,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
     id     = "expire"
     status = "Enabled"
     filter {}
-    expiration { days = var.log_retention_days }
-    abort_incomplete_multipart_upload { days_after_initiation = 7 }
+    expiration {
+      days = var.log_retention_days
+    }
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
   }
 }
 
@@ -130,7 +140,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
 # modern default.
 resource "aws_s3_bucket_ownership_controls" "logs" {
   bucket = aws_s3_bucket.logs.id
-  rule { object_ownership = "BucketOwnerPreferred" }
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
 }
 
 ##############################################################################
@@ -205,14 +217,18 @@ resource "aws_wafv2_web_acl" "this" {
   name  = "${var.name}-edge"
   scope = "CLOUDFRONT"
 
-  default_action { allow {} }
+  default_action {
 
+    allow {}
+
+  }
   # 1. Managed common rules.
   rule {
     name     = "AWSManagedCommonRuleSet"
     priority = 10
-    override_action { none {} }
-
+    override_action {
+      none {}
+    }
     statement {
       managed_rule_group_statement {
         vendor_name = "AWS"
@@ -223,11 +239,15 @@ resource "aws_wafv2_web_acl" "this" {
         # perfectly valid product copy with an unexplained 403.
         rule_action_override {
           name = "SizeRestrictions_BODY"
-          action_to_use { count {} }
+          action_to_use {
+            count {}
+          }
         }
         rule_action_override {
           name = "CrossSiteScripting_BODY"
-          action_to_use { count {} }
+          action_to_use {
+            count {}
+          }
         }
       }
     }
@@ -243,7 +263,9 @@ resource "aws_wafv2_web_acl" "this" {
   rule {
     name     = "AWSManagedKnownBadInputs"
     priority = 20
-    override_action { none {} }
+    override_action {
+      none {}
+    }
     statement {
       managed_rule_group_statement {
         vendor_name = "AWS"
@@ -264,8 +286,9 @@ resource "aws_wafv2_web_acl" "this" {
   rule {
     name     = "CheckoutRateLimit"
     priority = 30
-    action { block {} }
-
+    action {
+      block {}
+    }
     statement {
       rate_based_statement {
         limit              = var.rate_limit_checkout
@@ -275,7 +298,9 @@ resource "aws_wafv2_web_acl" "this" {
           byte_match_statement {
             positional_constraint = "STARTS_WITH"
             search_string         = "/api/bff/orders"
-            field_to_match { uri_path {} }
+            field_to_match {
+              uri_path {}
+            }
             text_transformation {
               priority = 0
               type     = "LOWERCASE"
@@ -296,8 +321,9 @@ resource "aws_wafv2_web_acl" "this" {
   rule {
     name     = "AuthRateLimit"
     priority = 40
-    action { block {} }
-
+    action {
+      block {}
+    }
     statement {
       rate_based_statement {
         limit              = var.rate_limit_auth
@@ -307,7 +333,9 @@ resource "aws_wafv2_web_acl" "this" {
           byte_match_statement {
             positional_constraint = "STARTS_WITH"
             search_string         = "/api/bff/auth"
-            field_to_match { uri_path {} }
+            field_to_match {
+              uri_path {}
+            }
             text_transformation {
               priority = 0
               type     = "LOWERCASE"
@@ -328,8 +356,9 @@ resource "aws_wafv2_web_acl" "this" {
   rule {
     name     = "GeneralRateLimit"
     priority = 50
-    action { block {} }
-
+    action {
+      block {}
+    }
     statement {
       rate_based_statement {
         limit              = var.rate_limit_general
@@ -352,13 +381,17 @@ resource "aws_wafv2_web_acl" "this" {
     content {
       name     = "AWSManagedBotControl"
       priority = 60
-      override_action { count {} }
+      override_action {
+        count {}
+      }
       statement {
         managed_rule_group_statement {
           vendor_name = "AWS"
           name        = "AWSManagedRulesBotControlRuleSet"
           managed_rule_group_configs {
-            aws_managed_rules_bot_control_rule_set { inspection_level = "COMMON" }
+            aws_managed_rules_bot_control_rule_set {
+              inspection_level = "COMMON"
+            }
           }
         }
       }
@@ -390,7 +423,11 @@ resource "aws_acm_certificate" "this" {
   subject_alternative_names = ["*.${var.domain_name}"]
   validation_method         = "DNS"
 
-  lifecycle { create_before_destroy = true }
+  lifecycle {
+
+    create_before_destroy = true
+
+  }
   tags = local.tags
 }
 
@@ -407,9 +444,15 @@ resource "aws_cloudfront_cache_policy" "static" {
   parameters_in_cache_key_and_forwarded_to_origin {
     enable_accept_encoding_brotli = true
     enable_accept_encoding_gzip   = true
-    cookies_config { cookie_behavior = "none" }
-    headers_config { header_behavior = "none" }
-    query_strings_config { query_string_behavior = "none" }
+    cookies_config {
+      cookie_behavior = "none"
+    }
+    headers_config {
+      header_behavior = "none"
+    }
+    query_strings_config {
+      query_string_behavior = "none"
+    }
   }
 }
 
@@ -430,15 +473,23 @@ resource "aws_cloudfront_cache_policy" "html" {
       # signed-in page is served to the next visitor. This is the single most
       # damaging CDN misconfiguration there is.
       cookie_behavior = "whitelist"
-      cookies { items = ["souq_session", "souq_locale", "souq_currency"] }
+      cookies {
+        items = ["souq_session", "souq_locale", "souq_currency"]
+      }
     }
 
     headers_config {
       header_behavior = "whitelist"
-      headers { items = ["Accept-Language", "CloudFront-Viewer-Country"] }
+      headers {
+        items = ["Accept-Language", "CloudFront-Viewer-Country"]
+      }
     }
 
-    query_strings_config { query_string_behavior = "all" }
+    query_strings_config {
+
+      query_string_behavior = "all"
+
+    }
   }
 }
 
@@ -473,7 +524,7 @@ resource "aws_cloudfront_distribution" "this" {
       # Generous, because checkout writes to Postgres and Kafka in one
       # transaction. A 30s ceiling here would turn a slow-but-succeeding order
       # into a 504 and a customer pressing the button again.
-      origin_read_timeout    = 60
+      origin_read_timeout      = 60
       origin_keepalive_timeout = 60
     }
 
@@ -486,13 +537,13 @@ resource "aws_cloudfront_distribution" "this" {
   }
 
   default_cache_behavior {
-    target_origin_id       = local.alb_origin
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods         = ["GET", "HEAD"]
-    compress               = true
-    cache_policy_id        = aws_cloudfront_cache_policy.html.id
-    origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer.id
+    target_origin_id           = local.alb_origin
+    viewer_protocol_policy     = "redirect-to-https"
+    allowed_methods            = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods             = ["GET", "HEAD"]
+    compress                   = true
+    cache_policy_id            = aws_cloudfront_cache_policy.html.id
+    origin_request_policy_id   = data.aws_cloudfront_origin_request_policy.all_viewer.id
     response_headers_policy_id = aws_cloudfront_response_headers_policy.security.id
   }
 
@@ -539,7 +590,9 @@ resource "aws_cloudfront_distribution" "this" {
   }
 
   restrictions {
-    geo_restriction { restriction_type = "none" }
+    geo_restriction {
+      restriction_type = "none"
+    }
   }
 
   viewer_certificate {
@@ -551,10 +604,10 @@ resource "aws_cloudfront_distribution" "this" {
   logging_config {
     bucket          = aws_s3_bucket.logs.bucket_domain_name
     prefix          = "cloudfront/"
-    include_cookies = false   # cookies carry the session token
+    include_cookies = false # cookies carry the session token
   }
 
-  tags = local.tags
+  tags       = local.tags
   depends_on = [aws_s3_bucket_ownership_controls.logs]
 }
 
@@ -568,7 +621,9 @@ resource "aws_cloudfront_response_headers_policy" "security" {
       preload                    = true
       override                   = true
     }
-    content_type_options { override = true }
+    content_type_options {
+      override = true
+    }
     frame_options {
       frame_option = "DENY"
       override     = true
@@ -593,8 +648,8 @@ resource "aws_cloudfront_response_headers_policy" "security" {
     items {
       # payment=(self) above and this CSP both have to allow the Paymob
       # iframe, or card entry silently fails to render.
-      header   = "Content-Security-Policy"
-      value    = join("; ", [
+      header = "Content-Security-Policy"
+      value = join("; ", [
         "default-src 'self'",
         "img-src 'self' data: https://${var.domain_name} https://*.cloudfront.net",
         "script-src 'self' 'unsafe-inline' https://accept.paymob.com",
@@ -613,7 +668,6 @@ resource "aws_cloudfront_response_headers_policy" "security" {
 data "aws_cloudfront_cache_policy" "disabled" {
   name = "Managed-CachingDisabled"
 }
-
 data "aws_cloudfront_origin_request_policy" "all_viewer" {
   name = "Managed-AllViewerExceptHostHeader"
 }

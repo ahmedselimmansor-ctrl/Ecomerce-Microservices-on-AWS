@@ -37,7 +37,7 @@ help: ## Show this help
 ## ---------------------------------------------------------------- verify
 
 .PHONY: check
-check: models contracts test lint frontend image-check k8s-check ## Everything CI runs, in the order that fails fastest
+check: models contracts test lint frontend image-check tf-check k8s-check ## Everything CI runs, in the order that fails fastest
 	@printf "\n$(BOLD)all checks passed$(OFF)\n"
 
 .PHONY: models
@@ -74,7 +74,20 @@ test-go:
 .PHONY: test-node
 test-node:
 	@printf "$(BOLD)node tests$(OFF)\n"
-	@cd libs/ts-contracts && npx vitest run 2>&1 | tail -6
+	@# Every Node package, not just the contracts. The three services had tests
+	@# that nothing local ran — CI found them missing before this did.
+	@for pkg in libs/ts-contracts $(addprefix services/,$(NODE_SERVICES)); do \
+	  if [ ! -d $$pkg/node_modules ]; then \
+	    printf "  $(DIM)$$pkg: dependencies not installed; skipping$(OFF)\n"; continue; \
+	  fi; \
+	  printf "  %-28s " "$$pkg"; \
+	  out=$$(cd $$pkg && npx vitest run 2>&1); \
+	  if [ $$? -eq 0 ]; then \
+	    printf "%s\n" "$$(echo "$$out" | grep -oE 'Tests +[0-9]+ passed \([0-9]+\)' | tail -1)"; \
+	  else \
+	    printf "$(RED)FAILED$(OFF)\n"; echo "$$out" | tail -12 | sed 's/^/      /'; exit 1; \
+	  fi; \
+	done
 
 .PHONY: test-py
 test-py:
@@ -145,6 +158,10 @@ frontend: ## Typecheck and build the storefront and the admin app
 image-check: ## Assert Dockerfiles, compose and the CI matrix agree (fast; no build)
 	@printf "$(BOLD)image consistency$(OFF)\n"
 	@python3 scripts/image-check.py
+
+.PHONY: tf-check
+tf-check: ## terraform fmt + validate every module and env
+	@bash scripts/tf-check.sh
 
 .PHONY: k8s-check
 k8s-check: ## Render both overlays and assert the workload policy

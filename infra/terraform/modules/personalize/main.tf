@@ -1,12 +1,19 @@
 ##############################################################################
 # Amazon Personalize.
 #
-# Terraform's coverage of Personalize is partial: dataset groups, schemas and
-# datasets are manageable, but solutions and campaigns are not (the provider
-# has no resource for them, because training is a long-running job whose
-# lifecycle does not fit an apply). So this module provisions everything up to
-# and including the datasets and the import pipeline, and the solution/campaign
-# lifecycle is driven by the runbook in docs/runbooks/personalize-retrain.md.
+# The hashicorp/aws provider has NO Personalize resources at all — not dataset
+# groups, not schemas, not datasets. `aws_personalize_*` does not exist, and an
+# earlier version of this file used it throughout; `terraform validate` rejects
+# every one with "Invalid resource type".
+#
+# The Cloud Control provider (hashicorp/awscc) does cover them, because it is
+# generated from the CloudFormation resource schemas and AWS publishes those
+# for Personalize. So dataset groups, schemas and datasets are `awscc_*` here.
+#
+# Solutions and campaigns are still not managed: training is a long-running job
+# whose lifecycle does not fit an apply, and a `terraform apply` that silently
+# blocks for 90 minutes on model training is worse than a documented manual
+# step. That part is driven by docs/runbooks/personalize-retrain.md.
 #
 # That split is stated plainly rather than papered over with a null_resource
 # running the CLI: a `terraform apply` that silently blocks for 90 minutes on a
@@ -16,22 +23,36 @@
 terraform {
   required_version = ">= 1.9"
   required_providers {
-    aws = { source = "hashicorp/aws", version = "~> 5.60" }
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.60"
+    }
+    # Cloud Control. The only provider that can manage Personalize.
+    awscc = {
+      source  = "hashicorp/awscc"
+      version = "~> 1.0"
+    }
   }
 }
 
-locals { tags = merge(var.tags, { Module = "personalize" }) }
+locals {
 
-resource "aws_personalize_dataset_group" "this" {
+  tags = merge(var.tags, { Module = "personalize" })
+
+}
+resource "awscc_personalize_dataset_group" "this" {
   name        = var.name
   kms_key_arn = var.kms_key_arn
   role_arn    = aws_iam_role.personalize.arn
-  tags        = local.tags
+
+  # No `tags`. The Cloud Control schema for a dataset group does not expose
+  # them, which is a real gap — cost allocation for Personalize has to be done
+  # at the account or the dataset-group name.
 }
 
 # The interactions schema. Personalize is strict about this: a field it does
 # not recognise fails the import with a message that does not name the field.
-resource "aws_personalize_schema" "interactions" {
+resource "awscc_personalize_schema" "interactions" {
   name = "${var.name}-interactions"
   schema = jsonencode({
     type      = "record"
@@ -57,7 +78,7 @@ resource "aws_personalize_schema" "interactions" {
   })
 }
 
-resource "aws_personalize_schema" "items" {
+resource "awscc_personalize_schema" "items" {
   name = "${var.name}-items"
   schema = jsonencode({
     type      = "record"
@@ -78,7 +99,7 @@ resource "aws_personalize_schema" "items" {
   })
 }
 
-resource "aws_personalize_schema" "users" {
+resource "awscc_personalize_schema" "users" {
   name = "${var.name}-users"
   schema = jsonencode({
     type      = "record"
@@ -93,25 +114,25 @@ resource "aws_personalize_schema" "users" {
   })
 }
 
-resource "aws_personalize_dataset" "interactions" {
+resource "awscc_personalize_dataset" "interactions" {
   name              = "${var.name}-interactions"
-  dataset_group_arn = aws_personalize_dataset_group.this.arn
+  dataset_group_arn = awscc_personalize_dataset_group.this.dataset_group_arn
   dataset_type      = "Interactions"
-  schema_arn        = aws_personalize_schema.interactions.arn
+  schema_arn        = awscc_personalize_schema.interactions.schema_arn
 }
 
-resource "aws_personalize_dataset" "items" {
+resource "awscc_personalize_dataset" "items" {
   name              = "${var.name}-items"
-  dataset_group_arn = aws_personalize_dataset_group.this.arn
+  dataset_group_arn = awscc_personalize_dataset_group.this.dataset_group_arn
   dataset_type      = "Items"
-  schema_arn        = aws_personalize_schema.items.arn
+  schema_arn        = awscc_personalize_schema.items.schema_arn
 }
 
-resource "aws_personalize_dataset" "users" {
+resource "awscc_personalize_dataset" "users" {
   name              = "${var.name}-users"
-  dataset_group_arn = aws_personalize_dataset_group.this.arn
+  dataset_group_arn = awscc_personalize_dataset_group.this.dataset_group_arn
   dataset_type      = "Users"
-  schema_arn        = aws_personalize_schema.users.arn
+  schema_arn        = awscc_personalize_schema.users.schema_arn
 }
 
 ##############################################################################
@@ -127,9 +148,9 @@ resource "aws_kinesis_firehose_delivery_stream" "activity" {
   destination = "extended_s3"
 
   extended_s3_configuration {
-    role_arn   = aws_iam_role.firehose.arn
-    bucket_arn = "arn:aws:s3:::${var.activity_bucket}"
-    prefix     = "interactions/dt=!{timestamp:yyyy-MM-dd}/"
+    role_arn            = aws_iam_role.firehose.arn
+    bucket_arn          = "arn:aws:s3:::${var.activity_bucket}"
+    prefix              = "interactions/dt=!{timestamp:yyyy-MM-dd}/"
     error_output_prefix = "errors/!{firehose:error-output-type}/dt=!{timestamp:yyyy-MM-dd}/"
 
     # 128MB or 5 minutes. Personalize imports are batch, so latency does not
@@ -244,8 +265,9 @@ data "archive_file" "transform" {
                   })
               except Exception:
                   out.append({"recordId": record["recordId"], "result": "Dropped"})
-          return {"records": out}
-
+          return {
+            "records": out
+          }
       def _epoch_seconds(iso):
           from datetime import datetime, timezone
           if not iso:
@@ -312,7 +334,7 @@ resource "aws_iam_role_policy" "firehose" {
       {
         Effect = "Allow"
         Action = ["s3:AbortMultipartUpload", "s3:GetBucketLocation", "s3:GetObject",
-                  "s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:PutObject"]
+        "s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:PutObject"]
         Resource = ["arn:aws:s3:::${var.activity_bucket}", "arn:aws:s3:::${var.activity_bucket}/*"]
       },
       { Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = "${aws_lambda_function.transform.arn}:*" },

@@ -141,7 +141,23 @@ export function render(
 
   // Fall back to en-GB per FIELD, not per template: a partially translated
   // template should still send, in a mix, rather than not send at all.
-  const pick = (m: Record<string, string>) => m[locale] ?? m[locale.slice(0, 2)] ?? m['en-GB']!;
+  const pick = (m: Record<string, string>): string => {
+    // Exact match first.
+    const exact = m[locale];
+    if (exact !== undefined) return exact;
+
+    // Then any variant sharing the language. This direction is the one that
+    // matters and it was missing: the templates are keyed 'ar-EG', so a user
+    // whose locale is a bare 'ar' fell straight through to English. The old
+    // `m[locale.slice(0, 2)]` only helped when the MAP held bare keys, which
+    // it never does.
+    const language = locale.slice(0, 2).toLowerCase();
+    for (const [key, value] of Object.entries(m)) {
+      if (key.slice(0, 2).toLowerCase() === language) return value;
+    }
+
+    return m['en-GB']!;
+  };
 
   // escape:false on the text body — Mustache would HTML-escape an apostrophe
   // in a product title into &#39; in a plain-text email.
@@ -152,5 +168,13 @@ export function render(
 }
 
 export function templateExists(name: string): name is TemplateName {
-  return name in TEMPLATES;
+  // Object.hasOwn, NOT `name in TEMPLATES`.
+  //
+  // `in` walks the prototype chain, so `'__proto__' in TEMPLATES` is true, as
+  // are 'constructor', 'toString' and every other Object.prototype member.
+  // This function guards a lookup driven by a Kafka message field, so a caller
+  // could pass `__proto__`, pass this check, and reach `TEMPLATES['__proto__']`
+  // — which is Object.prototype, not a template, and blows up in render with
+  // an error naming none of that.
+  return Object.hasOwn(TEMPLATES, name);
 }

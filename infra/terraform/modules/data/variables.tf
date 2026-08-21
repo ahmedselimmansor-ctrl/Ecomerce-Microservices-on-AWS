@@ -1,19 +1,15 @@
 variable "name" {
   type = string
 }
-
 variable "region" {
   type = string
 }
-
 variable "account_id" {
   type = string
 }
-
 variable "vpc_id" {
   type = string
 }
-
 variable "data_subnet_ids" {
   description = "Data-tier subnets. These have no route to a NAT gateway."
   type        = list(string)
@@ -50,8 +46,8 @@ variable "is_production" {
     not independent — a dev environment with production backup retention and
     no replicas is nobody's intent.
   EOT
-  type    = bool
-  default = false
+  type        = bool
+  default     = false
 }
 
 variable "postgres_engine_version" {

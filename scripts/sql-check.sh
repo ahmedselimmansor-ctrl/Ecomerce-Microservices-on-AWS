@@ -20,10 +20,35 @@ echo "starting throwaway postgres"
 cleanup
 docker run -d --rm --name "$CONTAINER" -e POSTGRES_PASSWORD=check \
   -p "$PORT:5432" postgres:16-alpine >/dev/null
-for _ in $(seq 1 60); do
-  docker exec "$CONTAINER" pg_isready -U postgres -q 2>/dev/null && break
+# pg_isready alone is NOT enough, and this cost a CI failure to learn.
+#
+# The postgres image runs initdb, starts a TEMPORARY server on a unix socket to
+# apply initialisation, shuts it down, then starts the real one. pg_isready
+# answers "yes" during that temporary phase, so on a cold runner the first
+# migration connects to a server that is about to be stopped and fails — while
+# every later one succeeds, because by then the real server is up.
+#
+# The signature is unmistakable once seen: the FIRST service fails, the rest
+# pass. Waiting for a query that actually returns a row closes it.
+ready=0
+for _ in $(seq 1 90); do
+  if docker exec "$CONTAINER" psql -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+    # Two consecutive successes, one second apart. A single success can still
+    # land inside the temporary server's window.
+    sleep 1
+    if docker exec "$CONTAINER" psql -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+  fi
   sleep 1
 done
+
+if [ "$ready" -ne 1 ]; then
+  echo "${RED}postgres never became ready${OFF}"
+  docker logs "$CONTAINER" 2>&1 | tail -20
+  exit 1
+fi
 
 psql() { docker exec -i "$CONTAINER" psql -U postgres -tA "$@"; }
 

@@ -20,8 +20,11 @@ terraform {
   }
 }
 
-locals { tags = merge(var.tags, { Module = "observability" }) }
+locals {
 
+  tags = merge(var.tags, { Module = "observability" })
+
+}
 resource "aws_prometheus_workspace" "this" {
   count = var.enable_managed_prometheus ? 1 : 0
 
@@ -246,8 +249,8 @@ resource "aws_prometheus_rule_group_namespace" "souq" {
 resource "aws_grafana_workspace" "this" {
   count = var.enable_managed_grafana ? 1 : 0
 
-  name                     = var.name
-  account_access_type      = "CURRENT_ACCOUNT"
+  name                = var.name
+  account_access_type = "CURRENT_ACCOUNT"
   # IAM Identity Center rather than local users: nobody should have a
   # standalone Grafana password, and offboarding must be one action.
   authentication_providers = ["AWS_SSO"]

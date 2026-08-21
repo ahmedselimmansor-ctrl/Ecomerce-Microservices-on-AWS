@@ -8,6 +8,12 @@ output "prometheus_remote_write_url" {
 output "grafana_endpoint" {
   value = var.enable_managed_grafana ? aws_grafana_workspace.this[0].endpoint : null
 }
-output "adot_role_arn"    { value = aws_iam_role.adot.arn }
-output "pages_topic_arn"  { value = aws_sns_topic.pages.arn }
-output "tickets_topic_arn"{ value = aws_sns_topic.tickets.arn }
+output "adot_role_arn" {
+  value = aws_iam_role.adot.arn
+}
+output "pages_topic_arn" {
+  value = aws_sns_topic.pages.arn
+}
+output "tickets_topic_arn" {
+  value = aws_sns_topic.tickets.arn
+}

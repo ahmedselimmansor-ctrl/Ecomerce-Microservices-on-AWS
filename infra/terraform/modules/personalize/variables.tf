@@ -1,6 +1,9 @@
-variable "name"        { type = string }
-variable "kms_key_arn" { type = string }
-
+variable "name" {
+  type = string
+}
+variable "kms_key_arn" {
+  type = string
+}
 variable "activity_bucket" {
   description = "Where Firehose lands the interaction files Personalize imports from."
   type        = string
@@ -13,8 +16,8 @@ variable "recipes" {
     long-running job that does not fit an apply. See
     docs/runbooks/personalize-retrain.md.
   EOT
-  type    = map(string)
-  default = {}
+  type        = map(string)
+  default     = {}
 }
 
 variable "tags" {

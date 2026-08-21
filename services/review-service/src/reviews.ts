@@ -1,6 +1,8 @@
 import type { Collection, Db } from 'mongodb';
 import { createHash } from 'node:crypto';
 import { logger } from './telemetry.js';
+import { EMPTY_DISTRIBUTION, bucketFor, summarise } from './rating.js';
+
 
 /**
  * Reviews.
@@ -272,7 +274,9 @@ export class ReviewsRepository {
     delta: number,
     verified: boolean,
   ): Promise<void> {
-    const bucket = `distribution.${rating - 1}`;
+    // bucketFor throws on a rating outside 1-5 rather than silently filing
+    // it into bucket 0 and corrupting every future average for this product.
+    const bucket = `distribution.${bucketFor(rating)}`;
 
     await this.summaries.updateOne(
       { _id: productId },
@@ -293,20 +297,14 @@ export class ReviewsRepository {
     const summary = await this.summaries.findOne({ _id: productId });
     if (!summary) return;
 
-    const dist = summary.distribution ?? [0, 0, 0, 0, 0];
-    const total = dist.reduce((a, b) => a + b, 0);
-    const weighted = dist.reduce((acc, n, i) => acc + n * (i + 1), 0);
+    // The arithmetic lives in ./rating.ts so it can be tested without Mongo.
+    // It is the code that decides the number on every product page, and an
+    // off-by-one here shifts every rating on the site by a whole star.
+    const { average, count } = summarise(summary.distribution ?? EMPTY_DISTRIBUTION);
 
     await this.summaries.updateOne(
       { _id: productId },
-      {
-        $set: {
-          // One decimal place, matching what the UI renders. Storing full
-          // precision invites two clients rounding differently.
-          average: total > 0 ? Math.round((weighted / total) * 10) / 10 : 0,
-          count: total,
-        },
-      },
+      { $set: { average, count } },
     );
   }
 

@@ -26,7 +26,7 @@ locals {
   # service -> sizing. checkout-path services get more capacity and a longer
   # backup window; catalog and identity are read-heavy and cheaper to run.
   postgres_clusters = {
-    identity  = { min_acu = 0.5, max_acu = var.is_production ? 8 : 2,  replicas = var.is_production ? 1 : 0 }
+    identity  = { min_acu = 0.5, max_acu = var.is_production ? 8 : 2, replicas = var.is_production ? 1 : 0 }
     catalog   = { min_acu = 0.5, max_acu = var.is_production ? 16 : 2, replicas = var.is_production ? 2 : 0 }
     orders    = { min_acu = 1.0, max_acu = var.is_production ? 32 : 4, replicas = var.is_production ? 2 : 0 }
     inventory = { min_acu = 1.0, max_acu = var.is_production ? 32 : 4, replicas = var.is_production ? 1 : 0 }
@@ -73,7 +73,9 @@ resource "aws_security_group" "postgres" {
   }
 
   tags = merge(local.tags, { Name = "${var.name}-pg" })
-  lifecycle { create_before_destroy = true }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_security_group" "redis" {
@@ -89,7 +91,9 @@ resource "aws_security_group" "redis" {
   }
 
   tags = merge(local.tags, { Name = "${var.name}-redis" })
-  lifecycle { create_before_destroy = true }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_security_group" "kafka" {
@@ -107,7 +111,9 @@ resource "aws_security_group" "kafka" {
   # 9092 (plaintext) is deliberately absent. There is no listener for it.
 
   tags = merge(local.tags, { Name = "${var.name}-msk" })
-  lifecycle { create_before_destroy = true }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_security_group" "search" {
@@ -123,7 +129,9 @@ resource "aws_security_group" "search" {
   }
 
   tags = merge(local.tags, { Name = "${var.name}-os" })
-  lifecycle { create_before_destroy = true }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_security_group" "documentdb" {
@@ -139,7 +147,9 @@ resource "aws_security_group" "documentdb" {
   }
 
   tags = merge(local.tags, { Name = "${var.name}-docdb" })
-  lifecycle { create_before_destroy = true }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 ##############################################################################
@@ -221,7 +231,11 @@ resource "aws_rds_cluster_parameter_group" "postgres" {
     apply_method = "pending-reboot"
   }
 
-  lifecycle { create_before_destroy = true }
+  lifecycle {
+
+    create_before_destroy = true
+
+  }
   tags = local.tags
 }
 
@@ -383,8 +397,12 @@ resource "aws_rds_cluster" "mysql" {
     max_capacity = var.is_production ? 16 : 2
   }
 
-  lifecycle { ignore_changes = [master_password] }
-  tags       = merge(local.tags, { Service = "analytics" })
+  lifecycle {
+
+    ignore_changes = [master_password]
+
+  }
+  tags = merge(local.tags, { Service = "analytics" })
 }
 
 resource "aws_security_group_rule" "mysql" {
@@ -497,8 +515,12 @@ resource "aws_msk_cluster" "this" {
 
   open_monitoring {
     prometheus {
-      jmx_exporter { enabled_in_broker = true }
-      node_exporter { enabled_in_broker = true }
+      jmx_exporter {
+        enabled_in_broker = true
+      }
+      node_exporter {
+        enabled_in_broker = true
+      }
     }
   }
 
@@ -594,7 +616,7 @@ resource "aws_elasticache_replication_group" "redis" {
   snapshot_retention_limit = var.is_production ? 7 : 0
   snapshot_window          = "03:00-05:00"
 
-  apply_immediately        = !var.is_production
+  apply_immediately          = !var.is_production
   auto_minor_version_upgrade = true
 
   log_delivery_configuration {
@@ -608,16 +630,23 @@ resource "aws_elasticache_replication_group" "redis" {
 }
 
 resource "aws_elasticache_parameter_group" "redis" {
-  name_prefix = "${var.name}-redis-"
-  family      = "redis7"
+  # `name`, not `name_prefix` — the resource has no name_prefix argument, and
+  # `name` is required. Combined with create_before_destroy below, a change to
+  # the parameters needs a new name, which is what the suffix is for.
+  name   = "${var.name}-redis7"
+  family = "redis7"
 
   parameter {
     name  = "maxmemory-policy"
     value = "allkeys-lru"
   }
 
-  lifecycle { create_before_destroy = true }
-  tags       = local.tags
+  lifecycle {
+
+    create_before_destroy = true
+
+  }
+  tags = local.tags
 }
 
 resource "random_password" "redis" {
@@ -689,15 +718,16 @@ resource "aws_opensearch_domain" "search" {
     enabled    = true
     kms_key_id = var.kms_key_arn
   }
-  node_to_node_encryption { enabled = true }
-
+  node_to_node_encryption {
+    enabled = true
+  }
   domain_endpoint_options {
     enforce_https       = true
     tls_security_policy = "Policy-Min-TLS-1-2-2019-07"
   }
 
   advanced_security_options {
-    enabled                        = true
+    enabled = true
     # IAM only. No internal user database means no OpenSearch password to
     # rotate or leak; search-service signs requests with its IRSA role.
     internal_user_database_enabled = false
@@ -774,8 +804,12 @@ resource "aws_docdb_cluster_parameter_group" "this" {
     value = "enabled"
   }
 
-  lifecycle { create_before_destroy = true }
-  tags       = local.tags
+  lifecycle {
+
+    create_before_destroy = true
+
+  }
+  tags = local.tags
 }
 
 resource "aws_docdb_cluster" "reviews" {
@@ -800,8 +834,12 @@ resource "aws_docdb_cluster" "reviews" {
 
   enabled_cloudwatch_logs_exports = ["audit", "profiler"]
 
-  lifecycle { ignore_changes = [master_password] }
-  tags       = local.tags
+  lifecycle {
+
+    ignore_changes = [master_password]
+
+  }
+  tags = local.tags
 }
 
 resource "aws_docdb_cluster_instance" "reviews" {
@@ -850,17 +888,47 @@ resource "aws_keyspaces_table" "delivery_log" {
   table_name    = "delivery_log"
 
   schema_definition {
-    column { name = "user_id",       type = "text" }
-    column { name = "sent_at",       type = "timestamp" }
-    column { name = "notification_id", type = "text" }
-    column { name = "channel",       type = "text" }
-    column { name = "template",      type = "text" }
-    column { name = "status",        type = "text" }
-    column { name = "dedupe_key",    type = "text" }
-    column { name = "provider_id",   type = "text" }
-    column { name = "error",         type = "text" }
+    column {
+      name = "user_id"
+      type = "text"
+    }
+    column {
+      name = "sent_at"
+      type = "timestamp"
+    }
+    column {
+      name = "notification_id"
+      type = "text"
+    }
+    column {
+      name = "channel"
+      type = "text"
+    }
+    column {
+      name = "template"
+      type = "text"
+    }
+    column {
+      name = "status"
+      type = "text"
+    }
+    column {
+      name = "dedupe_key"
+      type = "text"
+    }
+    column {
+      name = "provider_id"
+      type = "text"
+    }
+    column {
+      name = "error"
+      type = "text"
+    }
+    partition_key {
 
-    partition_key { name = "user_id" }
+      name = "user_id"
+
+    }
     # Newest first within a user, so "what did we send this customer?" is one
     # partition read with no sort.
     clustering_key {
@@ -882,8 +950,11 @@ resource "aws_keyspaces_table" "delivery_log" {
     kms_key_identifier = var.kms_key_arn
   }
 
-  point_in_time_recovery { status = var.is_production ? "ENABLED" : "DISABLED" }
+  point_in_time_recovery {
 
+    status = var.is_production ? "ENABLED" : "DISABLED"
+
+  }
   # Delivery history is operational, not archival. 90 days covers every
   # support question and keeps the table from growing without bound.
   default_time_to_live = 7776000
@@ -899,14 +970,30 @@ resource "aws_keyspaces_table" "dedupe" {
   table_name    = "dedupe"
 
   schema_definition {
-    column { name = "dedupe_key", type = "text" }
-    column { name = "sent_at",    type = "timestamp" }
-    column { name = "channel",    type = "text" }
+    column {
+      name = "dedupe_key"
+      type = "text"
+    }
+    column {
+      name = "sent_at"
+      type = "timestamp"
+    }
+    column {
+      name = "channel"
+      type = "text"
+    }
+    partition_key {
 
-    partition_key { name = "dedupe_key" }
+      name = "dedupe_key"
+
+    }
   }
 
-  capacity_specification { throughput_mode = "PAY_PER_REQUEST" }
+  capacity_specification {
+
+    throughput_mode = "PAY_PER_REQUEST"
+
+  }
   encryption_specification {
     type               = "CUSTOMER_MANAGED_KMS_KEY"
     kms_key_identifier = var.kms_key_arn

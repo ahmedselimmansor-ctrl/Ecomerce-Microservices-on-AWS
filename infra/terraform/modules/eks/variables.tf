@@ -1,8 +1,15 @@
-variable "name"       { type = string }
-variable "region"     { type = string }
-variable "account_id" { type = string }
-variable "vpc_id"     { type = string }
-
+variable "name" {
+  type = string
+}
+variable "region" {
+  type = string
+}
+variable "account_id" {
+  type = string
+}
+variable "vpc_id" {
+  type = string
+}
 variable "private_subnet_ids" {
   description = "Nodes and pods. Never public subnets: a pod with a public IP is one security-group mistake from being on the internet."
   type        = list(string)

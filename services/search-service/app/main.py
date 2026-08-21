@@ -127,7 +127,11 @@ async def observe(request: Request, call_next: Any) -> Response:
     started = time.perf_counter()
     # The TEMPLATED path, never the concrete one — concrete paths make the
     # metric cardinality unbounded and eventually take Prometheus down.
-    route = request.scope.get("route").path if request.scope.get("route") else request.url.path
+    # Bound once. Calling .get twice means the guard and the access are
+    # separate lookups with nothing tying them together — which is also why
+    # mypy flagged it: it cannot narrow the second call from the first.
+    matched = request.scope.get("route")
+    route = getattr(matched, "path", None) or request.url.path
 
     response = await call_next(request)
 
