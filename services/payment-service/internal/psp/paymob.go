@@ -709,6 +709,13 @@ func (p *Paymob) Refund(ctx context.Context, req RefundRequest) (Result, error) 
 	}
 
 	if err := p.post(ctx, "/acceptance/void_refund/refund", body, &resp); err != nil {
+		// Symmetric with Void, and it was missing. A refund of something
+		// already refunded has reached the end state the caller asked for, so
+		// reporting failure leaves the compensation retrying forever against a
+		// transaction that is already done — and every retry pages someone.
+		if isAlreadyReversed(err) {
+			return Result{Outcome: OutcomeApproved, ProviderRef: req.ProviderRef}, nil
+		}
 		return Result{Outcome: OutcomeUnknown}, err
 	}
 
@@ -719,11 +726,34 @@ func (p *Paymob) Refund(ctx context.Context, req RefundRequest) (Result, error) 
 	}, nil
 }
 
+// isAlreadyReversed matches every wording Paymob has been observed to use for
+// "this transaction has already been reversed".
+//
+// Matching on prose is unpleasant and it is what the API gives us — there is no
+// stable error code for this case. So the list is generous and each entry is a
+// real observed string rather than a guess: "has been refunded before" is the
+// one Paymob returns for a duplicate refund, and it matches none of the
+// patterns that were here, so the refund path failed even once it was wired to
+// call this.
 func isAlreadyReversed(err error) bool {
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "already voided") ||
-		strings.Contains(s, "already refunded") ||
-		strings.Contains(s, "transaction_already_reversed")
+
+	for _, phrase := range []string{
+		"already voided",
+		"already refunded",
+		"refunded before",
+		"voided before",
+		"already been refunded",
+		"already been voided",
+		"already reversed",
+		"transaction_already_reversed",
+		"transaction has been voided",
+	} {
+		if strings.Contains(s, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func outcomeOf(t paymobTransaction) Outcome {

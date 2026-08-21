@@ -693,3 +693,192 @@ func TestCallbackDoesNotRetainCardData(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Capture, Refund and Health.
+//
+// These were the uncovered half of this file, and they are the half that moves
+// money in the direction the customer notices: a capture that reports success
+// when Paymob declined it leaves the saga believing it has been paid.
+
+func TestCaptureMapsPaymobsOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		success bool
+		pending bool
+		want    Outcome
+	}{
+		{"an approved capture", true, false, OutcomeApproved},
+		{"a pending capture", false, true, OutcomePending},
+		// Neither success nor pending is a decline. Defaulting the other way —
+		// treating an unrecognised shape as approved — is how a saga confirms
+		// an order nothing was charged for.
+		{"a declined capture", false, false, OutcomeDeclined},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/auth/tokens" {
+					json.NewEncoder(w).Encode(map[string]any{"token": "t"})
+					return
+				}
+				json.NewEncoder(w).Encode(map[string]any{
+					"id": 987654, "success": tc.success, "pending": tc.pending,
+					"data": map[string]any{"txn_response_code": "APPROVED"},
+				})
+			}))
+			defer srv.Close()
+
+			res, err := newTestPaymob(t, srv.URL).Capture(context.Background(), CaptureRequest{
+				IdempotencyKey: "k", OrderID: "ord_1", ProviderRef: "987654",
+				Amount: Money{Amount: 129900, Currency: "EGP"},
+			})
+			if err != nil {
+				t.Fatalf("capture: %v", err)
+			}
+			if res.Outcome != tc.want {
+				t.Errorf("outcome = %s, want %s", res.Outcome, tc.want)
+			}
+			if res.ProviderRef != "987654" {
+				t.Errorf("providerRef = %q, want the transaction id back", res.ProviderRef)
+			}
+		})
+	}
+}
+
+// A transport failure during capture must be UNKNOWN, never DECLINED. The
+// money may well have moved; only the answer was lost. Reporting DECLINED
+// makes the saga compensate a capture that actually succeeded.
+func TestCaptureTransportFailureIsUnknown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/tokens" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"token": "t"})
+			return
+		}
+		// Close without a response: the request left, the answer did not.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Skip("the test server does not support hijacking")
+		}
+		conn, _, _ := hj.Hijack()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	res, _ := newTestPaymob(t, srv.URL).Capture(context.Background(), CaptureRequest{
+		IdempotencyKey: "k", OrderID: "ord_1", ProviderRef: "1",
+		Amount: Money{Amount: 100, Currency: "EGP"},
+	})
+	if res.Outcome != OutcomeUnknown {
+		t.Errorf("outcome = %s, want UNKNOWN — the money may have moved", res.Outcome)
+	}
+}
+
+func TestRefundMapsPaymobsOutcome(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/auth/tokens" {
+			json.NewEncoder(w).Encode(map[string]any{"token": "t"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": 111222, "success": true})
+	}))
+	defer srv.Close()
+
+	res, err := newTestPaymob(t, srv.URL).Refund(context.Background(), RefundRequest{
+		IdempotencyKey: "k", OrderID: "ord_1", ProviderRef: "111222",
+		Amount: Money{Amount: 5000, Currency: "EGP"},
+	})
+	if err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+	if res.Outcome != OutcomeApproved {
+		t.Errorf("outcome = %s, want APPROVED", res.Outcome)
+	}
+}
+
+// Same reasoning as the void case: a refund of something already refunded has
+// reached the end state the caller asked for. Failing it would leave the
+// compensation retrying forever against a transaction that is already done.
+func TestRefundOfAnAlreadyRefundedTransactionSucceeds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/auth/tokens" {
+			json.NewEncoder(w).Encode(map[string]any{"token": "t"})
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"message": "Transaction has been refunded before"})
+	}))
+	defer srv.Close()
+
+	res, err := newTestPaymob(t, srv.URL).Refund(context.Background(), RefundRequest{
+		IdempotencyKey: "k", OrderID: "ord_1", ProviderRef: "1",
+		Amount: Money{Amount: 100, Currency: "EGP"},
+	})
+	if err != nil {
+		t.Fatalf("an already-refunded transaction produced an error: %v", err)
+	}
+	if res.Outcome != OutcomeApproved {
+		t.Errorf("outcome = %s, want APPROVED", res.Outcome)
+	}
+}
+
+func TestHealthReflectsWhetherPaymobAnswers(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"token": "t"})
+	}))
+	defer ok.Close()
+
+	if err := newTestPaymob(t, ok.URL).Health(context.Background()); err != nil {
+		t.Errorf("health against a working Paymob: %v", err)
+	}
+
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer down.Close()
+
+	if err := newTestPaymob(t, down.URL).Health(context.Background()); err == nil {
+		t.Error("health reported healthy while Paymob was returning 503")
+	}
+}
+
+func TestNameIdentifiesTheProvider(t *testing.T) {
+	if got := newTestPaymob(t, "http://unused").Name(); got != "paymob" {
+		t.Errorf("Name() = %q, want %q — the ledger records this", got, "paymob")
+	}
+}
+
+// Every wording Paymob has been observed to use for an already-reversed
+// transaction. There is no stable error code for this case, so the match is on
+// prose — which makes it exactly the kind of thing that silently stops working.
+func TestAlreadyReversedRecognisesPaymobsWordings(t *testing.T) {
+	reversed := []string{
+		"Transaction already voided",
+		"Transaction has been refunded before",
+		"transaction has already been refunded",
+		"TRANSACTION_ALREADY_REVERSED",
+		"This transaction has been voided",
+	}
+	for _, message := range reversed {
+		if !isAlreadyReversed(errors.New(message)) {
+			t.Errorf("did not recognise %q as already reversed", message)
+		}
+	}
+
+	// And must not swallow a genuine failure as success.
+	notReversed := []string{
+		"Insufficient funds",
+		"Invalid transaction id",
+		"refund amount exceeds the captured amount",
+		"",
+	}
+	for _, message := range notReversed {
+		if isAlreadyReversed(errors.New(message)) {
+			t.Errorf("wrongly treated %q as already reversed", message)
+		}
+	}
+}

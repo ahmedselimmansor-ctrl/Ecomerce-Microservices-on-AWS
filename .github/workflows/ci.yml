@@ -386,8 +386,16 @@ jobs:
       # missing resource limits, no root.
       - name: Policy check
         run: |
-          curl -sSL https://github.com/kyverno/kyverno/releases/latest/download/kyverno-cli_linux_x86_64.tar.gz \
-            | tar xz -C /tmp
+          # Resolve the asset name from the API rather than guessing it. The
+          # published file is kyverno-cli_v<version>_linux_x86_64.tar.gz, so
+          # the unversioned path under releases/latest/download 404s — and a
+          # 404 body piped into tar reports "not in gzip format", which names
+          # neither the URL nor the status code.
+          url=$(curl -sSL https://api.github.com/repos/kyverno/kyverno/releases/latest \
+                | grep -o '"browser_download_url": *"[^"]*kyverno-cli_[^"]*linux_x86_64\.tar\.gz"' \
+                | head -1 | cut -d'"' -f4)
+          test -n "$url" || { echo "::error::could not resolve the kyverno CLI download URL"; exit 1; }
+          curl -sSL "$url" | tar xz -C /tmp
           /tmp/kyverno apply infra/k8s/policies/ --resource /tmp/ || true
 
   # ==========================================================================
@@ -451,7 +459,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Dependency and IaC scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -539,7 +547,7 @@ jobs:
           sbom: true
 
       - name: Scan the built image
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.sha }}
           format: table

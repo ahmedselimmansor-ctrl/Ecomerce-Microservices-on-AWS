@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -31,7 +30,6 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from .config import settings
 from .recommender import CAMPAIGNS, Placement, Recommender
 from .telemetry import (
-    CACHE,
     FALLBACK_REASONS,
     HTTP_DURATION,
     HTTP_REQUESTS,
